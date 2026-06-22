@@ -116,6 +116,27 @@ def extract_image(entry):
             return m.group(1)
     return None
 
+def extract_keywords(topics):
+    """Витягує ключові слова (власні імена) з заголовків — для фільтрації статей."""
+    keywords = set()
+    for topic in topics:
+        # Власні імена — слова з великої літери, довші 5 символів
+        words = re.findall(r'[А-ЯІЇЄҐ][а-яіїєґ]{4,}', topic)
+        for w in words[:3]:
+            keywords.add(w[:7].lower())  # перші 7 букв = захист від відмінювання
+    return keywords
+
+def filter_by_keywords(articles, keywords):
+    """Прибирає статті що містять заблоковані ключові слова."""
+    if not keywords:
+        return articles
+    result = []
+    for a in articles:
+        text = (a.get("title", "") + " " + a.get("summary", "")).lower()
+        if not any(kw in text for kw in keywords):
+            result.append(a)
+    return result
+
 def fetch_og_image(url):
     if not url:
         return None
@@ -447,8 +468,17 @@ def main():
         log.info("Всі свіжі новини вже опубліковані")
         return
 
-    # ── 5. Claude: обирає і пише пост ───────────────────────────────────────
+    # ── 5. Фільтруємо статті по ключових словах ДО Claude ───────────────────
     skip_topics = state.get("published_topics", [])
+    block_kw = extract_keywords(skip_topics)
+    if block_kw:
+        log.info(f"Блокуємо ключові слова: {block_kw}")
+        filtered = filter_by_keywords(new_articles, block_kw)
+        if len(filtered) >= 3:
+            new_articles = filtered
+            log.info(f"Після keyword-фільтру: {len(new_articles)} статей")
+        else:
+            log.info(f"Після фільтру лишилось {len(filtered)} — беремо всі щоб не мовчати")
     result = call_claude(new_articles[:40], skip_topics)
     if not result:
         log.error("Claude не повернув результат")
