@@ -422,7 +422,8 @@ def main():
         log.info("Usi novyny vzhe buly opublikovani.")
         return
 
-    result = analyze_with_claude(articles)
+    skip_topics = state.get("published_topics", [])
+    result = analyze_with_claude(articles, skip_topics)
     if not result:
         log.error("Claude ne zmih pidhotuvaty post.")
         return
@@ -462,6 +463,12 @@ def main():
         if published_ok:
             save_published(published, [article_key(a) for a in candidates])
             notify_admin("Post opublikovano v kanal!")
+            # Зберігаємо тему щоб не повторювати
+            topics = state.get("published_topics", [])
+            chosen_title = result.get("chosen_title", "")
+            if chosen_title and chosen_title not in topics:
+                topics.insert(0, chosen_title)
+                state["published_topics"] = topics[:20]  # зберігаємо останні 20
             # Після публікації — повертаємось у active
             state["mode"] = "active"
             state["last_approved"] = datetime.now(timezone.utc).timestamp()

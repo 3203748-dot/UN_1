@@ -25,6 +25,12 @@ jobs:
       - name: Write config.env
         run: echo "${{ secrets.UN_1_env }}" > config.env
 
+      - name: Pull latest state
+        run: |
+          git config user.email "bot@github-actions"
+          git config user.name "GitHub Actions Bot"
+          git pull --rebase origin main || true
+
       - name: Run news bot
         run: python news_bot.py
 
