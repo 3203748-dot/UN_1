@@ -250,13 +250,27 @@ def send_preview(text, image_url, cb_key):
     return None
 
 def publish_to_channel(text, image_url):
+    # Спроба з Markdown
     if image_url:
         r = tg_post("sendPhoto", chat_id=CHANNEL, photo=image_url,
                     caption=text, parse_mode="Markdown")
     else:
         r = tg_post("sendMessage", chat_id=CHANNEL, text=text, parse_mode="Markdown")
+
+    if r.get("ok"):
+        log.info("publish_to_channel: OK")
+        return True
+
+    log.warning(f"Markdown failed: {r.get('description')} — retry без форматування")
+    # Fallback без Markdown
+    plain = text.replace("*", "").replace("_", "").replace("`", "")
+    if image_url:
+        r = tg_post("sendPhoto", chat_id=CHANNEL, photo=image_url, caption=plain)
+    else:
+        r = tg_post("sendMessage", chat_id=CHANNEL, text=plain)
+
     ok = r.get("ok", False)
-    log.info(f"publish_to_channel: ok={ok}")
+    log.info(f"publish_to_channel fallback: ok={ok}, err={r.get('description','')}")
     return ok
 
 def notify_admin(msg):
