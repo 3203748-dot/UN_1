@@ -116,26 +116,6 @@ def extract_image(entry):
             return m.group(1)
     return None
 
-def extract_keywords(topics):
-    """Витягує ключові слова (власні імена) з заголовків — для фільтрації статей."""
-    keywords = set()
-    for topic in topics:
-        # Власні імена — слова з великої літери, довші 5 символів
-        words = re.findall(r'[А-ЯІЇЄҐ][а-яіїєґ]{4,}', topic)
-        for w in words[:3]:
-            keywords.add(w[:7].lower())  # перші 7 букв = захист від відмінювання
-    return keywords
-
-def filter_by_keywords(articles, keywords):
-    """Прибирає статті що містять заблоковані ключові слова."""
-    if not keywords:
-        return articles
-    result = []
-    for a in articles:
-        text = (a.get("title", "") + " " + a.get("summary", "")).lower()
-        if not any(kw in text for kw in keywords):
-            result.append(a)
-    return result
 
 def fetch_og_image(url):
     if not url:
@@ -190,9 +170,9 @@ def call_claude(articles, skip_topics):
     skip_block = ""
     if skip_topics:
         skip_block = (
-            "ВЖЕ ПОКАЗАНІ НОВИНИ (ці статті або подібні до них вже потрапляли — НЕ ОБИРАЙ нічого про ті самі події чи людей):\n" +
-            "\n".join(f"- {t}" for t in skip_topics[-40:]) +
-            "\n\n"
+            "ЦІ ПОДІЇ ВЖЕ БУЛИ ОПУБЛІКОВАНІ за останні 24 години — знайди щось ІНШЕ:\n" +
+            "\n".join(f"[{i+1}] {s}" for i, s in enumerate(skip_topics)) +
+            "\n\nВАЖЛИВО: навіть якщо нова стаття про ту саму людину — якщо це ІНША подія, її можна взяти. Але якщо це та САМА подія іншими словами або від іншого джерела — це повтор, не бери.\n\n"
         )
 
     prompt = f"""Ти редактор українського Telegram-каналу про політику та війну.
@@ -201,8 +181,7 @@ def call_claude(articles, skip_topics):
 {news_text}
 
 {skip_block}Завдання:
-1. Обери ОДНУ найважливішу статтю, яка НЕ стосується подій або осіб зі списку "ВЖЕ ПОКАЗАНІ НОВИНИ".
-   ПРАВИЛО: якщо будь-яка стаття зі списку і нова стаття — про одну й ту саму подію або людину (навіть різними словами, від різних джерел) — це ПОВТОР, не обирай її.
+1. Обери ОДНУ найважливішу статтю про подію, якої ЩЕ НЕ БУЛО в списку вже опублікованих.
 2. Напиши авторський пост українською мовою:
    - Рядок 1: заголовок з емодзі, обгорни в *зірочки* (до 10 слів)
    - Порожній рядок
@@ -367,12 +346,13 @@ def do_publish(state):
 def do_skip(state):
     title = state.get("pending_title", "")
     write_log("skipped", title)
-    # Зберігаємо тему навіть при пропуску — щоб не повторювалась
-    if title:
-        topics = state.get("published_topics", [])
-        if title not in topics:
-            topics.insert(0, title)
-            state["published_topics"] = topics[:20]
+    # Зберігаємо суть події при пропуску — щоб не повторювалась
+    post_text = state.get("pending_post_text", "")
+    if post_text:
+        summary = post_text.replace("*", "")[:200]
+        recent = state.get("recent_events", [])
+        recent.insert(0, summary)
+        state["recent_events"] = recent[:16]
     notify_admin("❌ Пост пропущено.")
     clear_pending(state)
     save_state(state)
@@ -468,17 +448,9 @@ def main():
         log.info("Всі свіжі новини вже опубліковані")
         return
 
-    # ── 5. Фільтруємо статті по ключових словах ДО Claude ───────────────────
-    skip_topics = state.get("published_topics", [])
-    block_kw = extract_keywords(skip_topics)
-    if block_kw:
-        log.info(f"Блокуємо ключові слова: {block_kw}")
-        filtered = filter_by_keywords(new_articles, block_kw)
-        if len(filtered) >= 3:
-            new_articles = filtered
-            log.info(f"Після keyword-фільтру: {len(new_articles)} статей")
-        else:
-            log.info(f"Після фільтру лишилось {len(filtered)} — беремо всі щоб не мовчати")
+    # ── 5. Готуємо контекст вже показаних подій для Claude ─────────────────
+    recent_events = state.get("recent_events", [])
+    skip_topics = recent_events  # передаємо у call_claude
     result = call_claude(new_articles[:40], skip_topics)
     if not result:
         log.error("Claude не повернув результат")
@@ -515,14 +487,12 @@ def main():
             pub_data[a["link"]] = now
     save_published(pub_data)
 
-    # Зберігаємо заголовки ВСІХ кандидатних статей у skip-список
-    # щоб наступного разу Claude не вибрав ту саму подію від іншого джерела
-    all_titles = [a["title"] for a in candidates if a.get("title")]
-    topics = state.get("published_topics", [])
-    for t in all_titles:
-        if t not in topics:
-            topics.append(t)
-    state["published_topics"] = topics[-40:]  # зберігаємо останні 40
+    # Зберігаємо суть події для наступного запуску
+    recent = state.get("recent_events", [])
+    # Перші 200 символів посту = суть події
+    event_summary = post_text.replace("*", "")[:200]
+    recent.insert(0, event_summary)
+    state["recent_events"] = recent[:16]  # ~24 год при 90-хв інтервалі
 
     state.update({
         "last_sent":          now,
