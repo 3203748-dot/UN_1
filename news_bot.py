@@ -248,7 +248,7 @@ def analyze_with_claude(articles, skip_topics=None):
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             json={
-                "model": "claude-haiku-4-5-20251001",
+                "model": "claude-sonnet-4-6",
                 "max_tokens": 1024,
                 "messages": [{"role": "user", "content": prompt}],
             },
@@ -475,6 +475,18 @@ def main():
     if missing:
         log.error(f"Відсутні змінні: {', '.join(missing)}. Перевір config.env")
         return
+
+    # Видаляємо webhook якщо був — інакше getUpdates не отримує callbacks (помилка 409)
+    try:
+        wh = requests.get(BASE_TG + "/getWebhookInfo", timeout=10).json()
+        if wh.get("result", {}).get("url"):
+            log.warning(f"Активний webhook: {wh['result']['url']} — видаляємо")
+            requests.post(BASE_TG + "/deleteWebhook",
+                          json={"drop_pending_updates": False}, timeout=10)
+        else:
+            log.info("Webhook не активний — OK")
+    except Exception as e:
+        log.warning(f"getWebhookInfo error: {e}")
 
     state = load_state()
     now   = datetime.now(timezone.utc).timestamp()
