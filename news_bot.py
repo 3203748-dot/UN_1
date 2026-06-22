@@ -343,81 +343,62 @@ def delete_message(msg_id):
 
 
 def wait_for_decision(cb_key: str, timeout: int = 20 * 60) -> str:
-    """Blocking poll. Повертає 'publish'/'skip'/'pending' (якщо час вийшов)."""
+    """Blocking long-poll. Повертає 'publish'/'skip'/'pending'."""
     import time
-
-    # Очищаємо старі оновлення щоб не плутатись
-    try:
-        resp = requests.get(BASE_TG + "/getUpdates",
-                            params={"timeout": 0, "allowed_updates": ["callback_query"]},
-                            timeout=10)
-        updates = resp.json().get("result", [])
-        offset = None
-        if updates:
-            last_id = updates[-1]["update_id"]
-            requests.get(BASE_TG + "/getUpdates",
-                         params={"offset": last_id + 1, "timeout": 0}, timeout=5)
-            offset = last_id + 1
-            log.info(f"Очищено {len(updates)} старих оновлень, offset={offset}")
-    except Exception as e:
-        log.warning(f"Помилка очищення черги: {e}")
-        offset = None
-
+    offset = None
     deadline = datetime.now(timezone.utc).timestamp() + timeout
+    log.info(f"Старт polling, cb_key={cb_key}, timeout={timeout // 60} хв")
+
     while datetime.now(timezone.utc).timestamp() < deadline:
         try:
             params = {"timeout": 20, "allowed_updates": ["callback_query"]}
-            if offset:
+            if offset is not None:
                 params["offset"] = offset
             resp = requests.get(BASE_TG + "/getUpdates", params=params, timeout=30)
+
             for upd in resp.json().get("result", []):
                 offset = upd["update_id"] + 1
                 cb = upd.get("callback_query")
                 if not cb:
                     continue
-                data = cb.get("data", "")
-                requests.post(BASE_TG + "/answerCallbackQuery",
-                              json={"callback_query_id": cb["id"]}, timeout=5)
-                log.info(f"Callback отримано: {data}")
-                if cb_key in data:
-                    return data.split("|")[0]
+                cb_data = cb.get("data", "")
+                log.info(f"Callback: {cb_data!r}")
+                try:
+                    requests.post(BASE_TG + "/answerCallbackQuery",
+                                  json={"callback_query_id": cb["id"]}, timeout=5)
+                except Exception:
+                    pass
+                if cb_key in cb_data:
+                    return cb_data.split("|")[0]
         except Exception as e:
             log.warning(f"Polling error: {e}")
             time.sleep(5)
+
+    log.info("Polling timeout — рішення не прийнято")
     return "pending"
 
 
 def check_pending_decision(cb_key: str, state: dict):
-    """Перевіряє getUpdates ОДИН РАЗ. Зберігає offset в state. Повертає 'publish'/'skip'/None."""
+    """Швидка перевірка getUpdates (без очікування). Повертає 'publish'/'skip'/None."""
     try:
-        params = {"timeout": 0, "allowed_updates": ["callback_query"]}
-        offset = state.get("tg_offset")
-        if offset:
-            params["offset"] = offset
-
-        resp = requests.get(BASE_TG + "/getUpdates", params=params, timeout=10)
-        updates = resp.json().get("result", [])
-
-        result = None
-        for upd in updates:
-            # Зсуваємо offset вперед для кожного оновлення
-            state["tg_offset"] = upd["update_id"] + 1
-
+        resp = requests.get(BASE_TG + "/getUpdates",
+                            params={"timeout": 0, "allowed_updates": ["callback_query"]},
+                            timeout=10)
+        for upd in resp.json().get("result", []):
             cb = upd.get("callback_query")
             if not cb:
                 continue
-            data = cb.get("data", "")
-
-            # Відповідаємо на callback щоб кнопка не "крутилась"
-            requests.post(BASE_TG + "/answerCallbackQuery",
-                          json={"callback_query_id": cb["id"]}, timeout=5)
-
-            if cb_key in data and result is None:
-                result = data.split("|")[0]
-
-        return result
+            cb_data = cb.get("data", "")
+            log.info(f"check_pending: {cb_data!r}")
+            try:
+                requests.post(BASE_TG + "/answerCallbackQuery",
+                              json={"callback_query_id": cb["id"]}, timeout=5)
+            except Exception:
+                pass
+            if cb_key in cb_data:
+                return cb_data.split("|")[0]
     except Exception as e:
-        log.warning(f"Помилка перевірки callback: {e}")
+        log.warning(f"check_pending error: {e}")
     return None
 
 
