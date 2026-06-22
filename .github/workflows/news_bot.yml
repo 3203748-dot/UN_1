@@ -28,10 +28,11 @@ jobs:
       - name: Write config.env
         run: echo "${{ secrets.UN_1_env }}" > config.env
 
-      - name: Pull latest state
+      - name: Configure git
         run: |
           git config user.email "bot@github-actions"
           git config user.name "GitHub Actions Bot"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
           git pull --rebase origin main || true
 
       - name: Run bot
@@ -40,9 +41,7 @@ jobs:
       - name: Save state
         if: always()
         run: |
-          git config user.email "bot@github-actions"
-          git config user.name "GitHub Actions Bot"
           git add state.json published.json posts_log.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "bot: state update [skip ci]"
           git pull --rebase origin main || true
-          git push origin main || true
+          git push origin main
