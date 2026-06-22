@@ -25,5 +25,8 @@ jobs:
       - name: Write config.env
         run: echo "${{ secrets.UN_1_env }}" > config.env
 
+      - name: List files
+        run: ls -la
+
       - name: Run news bot
         run: python news_bot.py
