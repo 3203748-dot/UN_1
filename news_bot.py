@@ -342,6 +342,33 @@ def delete_message(msg_id):
         pass
 
 
+def wait_for_decision(cb_key: str, timeout: int = 25 * 60) -> str:
+    """Блокуючий polling до 25 хв. Повертає 'publish'/'skip'/'timeout'."""
+    import time
+    deadline = datetime.now(timezone.utc).timestamp() + timeout
+    offset = None
+    while datetime.now(timezone.utc).timestamp() < deadline:
+        try:
+            params = {"timeout": 20, "allowed_updates": ["callback_query"]}
+            if offset:
+                params["offset"] = offset
+            resp = requests.get(BASE_TG + "/getUpdates", params=params, timeout=30)
+            for upd in resp.json().get("result", []):
+                offset = upd["update_id"] + 1
+                cb = upd.get("callback_query")
+                if not cb:
+                    continue
+                data = cb.get("data", "")
+                requests.post(BASE_TG + "/answerCallbackQuery",
+                              json={"callback_query_id": cb["id"]}, timeout=5)
+                if cb_key in data:
+                    return data.split("|")[0]
+        except Exception as e:
+            log.warning(f"Polling error: {e}")
+            time.sleep(5)
+    return "timeout"
+
+
 def check_pending_decision(cb_key: str, state: dict):
     """Перевіряє getUpdates ОДИН РАЗ. Зберігає offset в state. Повертає 'publish'/'skip'/None."""
     try:
@@ -415,61 +442,12 @@ def main():
         log.error(f"Відсутні змінні: {', '.join(missing)}. Перевір config.env")
         return
 
-    state   = load_state()
-    now     = datetime.now(timezone.utc).timestamp()
-    mode    = state.get("mode", "active")
-    timeout = MODE_ACTIVE_TIMEOUT if mode == "active" else MODE_SLOW_TIMEOUT
+    state    = load_state()
+    now      = datetime.now(timezone.utc).timestamp()
+    mode     = state.get("mode", "active")
+    timeout  = MODE_ACTIVE_TIMEOUT if mode == "active" else MODE_SLOW_TIMEOUT
     interval = MODE_ACTIVE_INTERVAL if mode == "active" else MODE_SLOW_INTERVAL
 
-    # ── ФАЗА 1: є pending preview — перевіряємо чи є рішення ────────────────
-    pending = state.get("pending")
-    if pending:
-        cb_key   = pending["cb_key"]
-        decision = check_pending_decision(cb_key, state)
-        sent_at  = pending.get("sent_at", 0)
-        post_text    = pending["post_text"]
-        image_url    = pending.get("image_url")
-        chosen_title = pending.get("chosen_title", "")
-        candidate_keys = pending.get("candidate_keys", [])
-        published    = load_published()
-
-        if decision == "publish":
-            published_ok = publish_to_channel(post_text, image_url)
-            if published_ok:
-                save_published(published, candidate_keys)
-                save_post_log("published", chosen_title, post_text, image_url)
-                topics = state.get("published_topics", [])
-                if chosen_title and chosen_title not in topics:
-                    topics.insert(0, chosen_title)
-                    state["published_topics"] = topics[:20]
-                state["mode"] = "active"
-                state["last_approved"] = now
-                notify_admin("✅ Пост опубліковано в канал!")
-            state.pop("pending", None)
-            save_state(state)
-
-        elif decision == "skip":
-            save_published(published, candidate_keys)
-            save_post_log("skipped", chosen_title, post_text, image_url)
-            notify_admin("❌ Пост пропущено.")
-            state.pop("pending", None)
-            save_state(state)
-
-        elif now - sent_at > timeout:
-            # Таймаут — ніхто не відповів
-            save_published(published, candidate_keys)
-            save_post_log("timeout", chosen_title, post_text, image_url)
-            state["mode"] = "slow"
-            state.pop("pending", None)
-            save_state(state)
-            log.info("Таймаут. Режим → slow.")
-        else:
-            log.info(f"Очікуємо рішення адміна ({(timeout - (now - sent_at)) / 60:.0f} хв залишилось).")
-            save_state(state)  # зберігаємо оновлений tg_offset
-
-        return  # завжди виходимо після обробки pending
-
-    # ── ФАЗА 2: немає pending — чи час надсилати нове preview? ──────────────
     last_sent = state.get("last_sent") or 0
     elapsed = now - last_sent
     if elapsed < interval:
@@ -518,22 +496,34 @@ def main():
     if not msg_id:
         return
 
-    # Зберігаємо кандидатів одразу — щоб не повторювались
+    # Зберігаємо все ДО очікування — щоб навіть при таймауті не повторювалось
     save_published(published, [article_key(a) for a in candidates])
-
-    # Зберігаємо pending стан і виходимо
     state["last_sent"] = now
-    state["pending"] = {
-        "cb_key":        cb_key,
-        "msg_id":        msg_id,
-        "post_text":     post_text,
-        "image_url":     image_url,
-        "chosen_title":  chosen_title,
-        "sent_at":       now,
-        "candidate_keys": [article_key(a) for a in candidates],
-    }
     save_state(state)
-    log.info("Preview надіслано. Чекаємо рішення на наступному запуску.")
+
+    # Чекаємо рішення (до 25 хв — вкладається в 35-хв таймаут Actions)
+    decision = wait_for_decision(cb_key, min(timeout, 25 * 60))
+
+    if decision == "publish":
+        published_ok = publish_to_channel(post_text, image_url)
+        if published_ok:
+            save_post_log("published", chosen_title, post_text, image_url)
+            topics = state.get("published_topics", [])
+            if chosen_title and chosen_title not in topics:
+                topics.insert(0, chosen_title)
+                state["published_topics"] = topics[:20]
+            state["mode"] = "active"
+            state["last_approved"] = now
+            save_state(state)
+            notify_admin("✅ Пост опубліковано в канал!")
+    elif decision == "skip":
+        save_post_log("skipped", chosen_title, post_text, image_url)
+        notify_admin("❌ Пост пропущено.")
+    else:
+        save_post_log("timeout", chosen_title, post_text, image_url)
+        state["mode"] = "slow"
+        save_state(state)
+        log.info("Таймаут. Режим → slow.")
 
 
 if __name__ == "__main__":
