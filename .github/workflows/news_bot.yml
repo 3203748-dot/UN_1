@@ -1,0 +1,29 @@
+name: Ukraine News Bot
+
+on:
+  schedule:
+    - cron: '0 6,12,18,0 * * *'   # 06:00, 12:00, 18:00, 00:00 UTC (09:00, 15:00, 21:00, 03:00 Kyiv)
+  workflow_dispatch:                 # дозволяє запустити вручну з GitHub
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install feedparser requests python-dotenv
+
+      - name: Write config.env
+        run: echo "${{ secrets.UN_1_env }}" > config.env
+
+      - name: Run news bot
+        run: python news_bot.py
