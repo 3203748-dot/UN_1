@@ -343,28 +343,27 @@ def delete_message(msg_id):
 
 
 def wait_for_decision(cb_key: str, timeout: int = 25 * 60) -> str:
-    """Блокуючий polling до 25 хв. Повертає 'publish'/'skip'/'timeout'."""
+    """Short-poll (1 хв) — не блокує довго. Повертає 'publish'/'skip'/'timeout'."""
     import time
 
-    # Спочатку очищаємо всі старі оновлення щоб не плутались з новими
+    # Очищаємо старі оновлення
     try:
         resp = requests.get(BASE_TG + "/getUpdates",
                             params={"timeout": 0, "allowed_updates": ["callback_query"]},
                             timeout=10)
         updates = resp.json().get("result", [])
+        offset = None
         if updates:
             last_id = updates[-1]["update_id"]
             requests.get(BASE_TG + "/getUpdates",
                          params={"offset": last_id + 1, "timeout": 0}, timeout=5)
             offset = last_id + 1
-            log.info(f"Очищено {len(updates)} старих оновлень, offset={offset}")
-        else:
-            offset = None
     except Exception as e:
         log.warning(f"Помилка очищення черги: {e}")
         offset = None
 
-    deadline = datetime.now(timezone.utc).timestamp() + timeout
+    # Чекаємо до 60 секунд (щоб вкластись у GH Actions job)
+    deadline = datetime.now(timezone.utc).timestamp() + 60
     while datetime.now(timezone.utc).timestamp() < deadline:
         try:
             params = {"timeout": 20, "allowed_updates": ["callback_query"]}
@@ -384,7 +383,7 @@ def wait_for_decision(cb_key: str, timeout: int = 25 * 60) -> str:
         except Exception as e:
             log.warning(f"Polling error: {e}")
             time.sleep(5)
-    return "timeout"
+    return "pending"
 
 
 def check_pending_decision(cb_key: str, state: dict):
@@ -448,6 +447,41 @@ def notify_admin(text):
                   json={"chat_id": ADMIN_CHAT_ID, "text": text}, timeout=10)
 
 
+def _do_publish(state, now):
+    """Публікує збережений pending-пост."""
+    post_text  = state.get("pending_post_text", "")
+    image_url  = state.get("pending_image_url")
+    title      = state.get("pending_title", "")
+    ok = publish_to_channel(post_text, image_url)
+    if ok:
+        save_post_log("published", title, post_text, image_url)
+        topics = state.get("published_topics", [])
+        if title and title not in topics:
+            topics.insert(0, title)
+            state["published_topics"] = topics[:20]
+        state["mode"] = "active"
+        state["last_approved"] = now
+        notify_admin("✅ Пост опубліковано в канал!")
+    _clear_pending(state)
+    save_state(state)
+
+
+def _do_skip(state):
+    save_post_log("skipped",
+                  state.get("pending_title", ""),
+                  state.get("pending_post_text", ""),
+                  state.get("pending_image_url"))
+    notify_admin("❌ Пост пропущено.")
+    _clear_pending(state)
+    save_state(state)
+
+
+def _clear_pending(state):
+    for k in ("pending_cb_key", "pending_post_text", "pending_image_url",
+              "pending_title", "pending_sent_at", "tg_offset"):
+        state.pop(k, None)
+
+
 def main():
     log.info("=== News Bot запущено ===")
     missing = [k for k, v in {
@@ -460,14 +494,44 @@ def main():
         log.error(f"Відсутні змінні: {', '.join(missing)}. Перевір config.env")
         return
 
-    state    = load_state()
-    now      = datetime.now(timezone.utc).timestamp()
-    mode     = state.get("mode", "active")
-    timeout  = MODE_ACTIVE_TIMEOUT if mode == "active" else MODE_SLOW_TIMEOUT
-    interval = MODE_ACTIVE_INTERVAL if mode == "active" else MODE_SLOW_INTERVAL
+    state = load_state()
+    now   = datetime.now(timezone.utc).timestamp()
 
+    # ── ФАЗА 1: чи є незавершений preview? ────────────────────────────────────
+    pending_cb = state.get("pending_cb_key")
+    if pending_cb:
+        sent_at = state.get("pending_sent_at", 0)
+        mode    = state.get("mode", "active")
+        timeout = MODE_ACTIVE_TIMEOUT if mode == "active" else MODE_SLOW_TIMEOUT
+
+        decision = check_pending_decision(pending_cb, state)
+
+        if decision == "publish":
+            _do_publish(state, now)
+            return
+        elif decision == "skip":
+            _do_skip(state)
+            return
+        elif (now - sent_at) > timeout:
+            log.info("Таймаут очікування. Режим → slow.")
+            save_post_log("timeout",
+                          state.get("pending_title", ""),
+                          state.get("pending_post_text", ""),
+                          state.get("pending_image_url"))
+            state["mode"] = "slow"
+            _clear_pending(state)
+            save_state(state)
+        else:
+            log.info(f"Очікуємо рішення ({(now - sent_at)/60:.0f} хв тому надіслано). "
+                     "Ще нічого не натиснуто.")
+            save_state(state)   # зберігаємо tg_offset оновлений check_pending_decision
+        return   # поки pending — нову новину не генеруємо
+
+    # ── ФАЗА 2: перевіряємо інтервал і генеруємо новий пост ──────────────────
+    mode     = state.get("mode", "active")
+    interval = MODE_ACTIVE_INTERVAL if mode == "active" else MODE_SLOW_INTERVAL
     last_sent = state.get("last_sent") or 0
-    elapsed = now - last_sent
+    elapsed   = now - last_sent
     if elapsed < interval:
         log.info(f"Ще не час. Режим={mode}, залишилось {(interval - elapsed) / 60:.0f} хв.")
         return
@@ -478,7 +542,7 @@ def main():
         return
 
     published = load_published()
-    articles = [a for a in articles if article_key(a) not in published]
+    articles  = [a for a in articles if article_key(a) not in published]
     log.info(f"Після фільтру дублів: {len(articles)} нових новин.")
     if not articles:
         log.info("Усі новини вже були опубліковані.")
@@ -514,34 +578,17 @@ def main():
     if not msg_id:
         return
 
-    # Зберігаємо все ДО очікування — щоб навіть при таймауті не повторювалось
+    # Зберігаємо все — pending-стан + опубліковані URL
     save_published(published, [article_key(a) for a in candidates])
-    state["last_sent"] = now
+    state["last_sent"]          = now
+    state["pending_cb_key"]     = cb_key
+    state["pending_post_text"]  = post_text
+    state["pending_image_url"]  = image_url
+    state["pending_title"]      = chosen_title
+    state["pending_sent_at"]    = now
+    state.pop("tg_offset", None)   # скидаємо offset — наступний run читатиме з нуля
     save_state(state)
-
-    # Чекаємо рішення (до 25 хв — вкладається в 35-хв таймаут Actions)
-    decision = wait_for_decision(cb_key, min(timeout, 25 * 60))
-
-    if decision == "publish":
-        published_ok = publish_to_channel(post_text, image_url)
-        if published_ok:
-            save_post_log("published", chosen_title, post_text, image_url)
-            topics = state.get("published_topics", [])
-            if chosen_title and chosen_title not in topics:
-                topics.insert(0, chosen_title)
-                state["published_topics"] = topics[:20]
-            state["mode"] = "active"
-            state["last_approved"] = now
-            save_state(state)
-            notify_admin("✅ Пост опубліковано в канал!")
-    elif decision == "skip":
-        save_post_log("skipped", chosen_title, post_text, image_url)
-        notify_admin("❌ Пост пропущено.")
-    else:
-        save_post_log("timeout", chosen_title, post_text, image_url)
-        state["mode"] = "slow"
-        save_state(state)
-        log.info("Таймаут. Режим → slow.")
+    log.info("Preview надіслано. Наступний запуск перевірить рішення.")
 
 
 if __name__ == "__main__":
