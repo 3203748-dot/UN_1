@@ -5,6 +5,10 @@ on:
     - cron: '*/30 * * * *'   # кожні 30 хв; бот сам вирішує чи час публікувати
   workflow_dispatch:          # ручний запуск з GitHub
 
+concurrency:
+  group: news-bot
+  cancel-in-progress: false   # черга, не скасування
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
