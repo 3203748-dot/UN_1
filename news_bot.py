@@ -342,34 +342,31 @@ def delete_message(msg_id):
         pass
 
 
-def wait_for_decision(callback_data, timeout):
-    log.info("Ochikuyemo rishennya admina (do %d khv)...", timeout // 60)
-    offset = None
-    deadline = datetime.now(timezone.utc).timestamp() + timeout
-    while datetime.now(timezone.utc).timestamp() < deadline:
-        try:
-            params = {"timeout": 30, "allowed_updates": ["callback_query"]}
-            if offset:
-                params["offset"] = offset
-            resp = requests.get(BASE_TG + "/getUpdates", params=params, timeout=40)
-            updates = resp.json().get("result", [])
-            for upd in updates:
-                offset = upd["update_id"] + 1
-                cb = upd.get("callback_query")
-                if not cb:
-                    continue
-                data = cb.get("data", "")
-                if callback_data not in data:
-                    continue
-                requests.post(BASE_TG + "/answerCallbackQuery",
-                              json={"callback_query_id": cb["id"]}, timeout=5)
-                action = data.split("|")[0]
-                log.info("Rishennya admina: %s", action)
-                return action
-        except Exception as e:
-            log.warning("Polling error: %s", e)
-    log.warning("Chas ochikuvannya vyishov.")
-    return "timeout"
+def check_pending_decision(cb_key: str):
+    """Перевіряє getUpdates ОДИН РАЗ (без очікування). Повертає 'publish'/'skip'/None."""
+    try:
+        resp = requests.get(
+            BASE_TG + "/getUpdates",
+            params={"timeout": 0, "allowed_updates": ["callback_query"]},
+            timeout=10,
+        )
+        updates = resp.json().get("result", [])
+        for upd in updates:
+            cb = upd.get("callback_query")
+            if not cb:
+                continue
+            data = cb.get("data", "")
+            if cb_key not in data:
+                continue
+            requests.post(BASE_TG + "/answerCallbackQuery",
+                          json={"callback_query_id": cb["id"]}, timeout=5)
+            # Споживаємо оновлення щоб не читати повторно
+            requests.get(BASE_TG + "/getUpdates",
+                         params={"offset": upd["update_id"] + 1, "timeout": 0}, timeout=5)
+            return data.split("|")[0]
+    except Exception as e:
+        log.warning(f"Помилка перевірки callback: {e}")
+    return None
 
 
 def publish_to_channel(text, image_url=None):
@@ -411,27 +408,66 @@ def main():
         log.error(f"Відсутні змінні: {', '.join(missing)}. Перевір config.env")
         return
 
-    # Завантажуємо стан
-    state = load_state()
-    now = datetime.now(timezone.utc).timestamp()
-    mode = state.get("mode", "active")
+    state   = load_state()
+    now     = datetime.now(timezone.utc).timestamp()
+    mode    = state.get("mode", "active")
+    timeout = MODE_ACTIVE_TIMEOUT if mode == "active" else MODE_SLOW_TIMEOUT
+    interval = MODE_ACTIVE_INTERVAL if mode == "active" else MODE_SLOW_INTERVAL
+
+    # ── ФАЗА 1: є pending preview — перевіряємо чи є рішення ────────────────
+    pending = state.get("pending")
+    if pending:
+        cb_key   = pending["cb_key"]
+        decision = check_pending_decision(cb_key)
+        sent_at  = pending.get("sent_at", 0)
+        post_text    = pending["post_text"]
+        image_url    = pending.get("image_url")
+        chosen_title = pending.get("chosen_title", "")
+        candidate_keys = pending.get("candidate_keys", [])
+        published    = load_published()
+
+        if decision == "publish":
+            published_ok = publish_to_channel(post_text, image_url)
+            if published_ok:
+                save_published(published, candidate_keys)
+                save_post_log("published", chosen_title, post_text, image_url)
+                topics = state.get("published_topics", [])
+                if chosen_title and chosen_title not in topics:
+                    topics.insert(0, chosen_title)
+                    state["published_topics"] = topics[:20]
+                state["mode"] = "active"
+                state["last_approved"] = now
+                notify_admin("✅ Пост опубліковано в канал!")
+            state.pop("pending", None)
+            save_state(state)
+
+        elif decision == "skip":
+            save_published(published, candidate_keys)
+            save_post_log("skipped", chosen_title, post_text, image_url)
+            notify_admin("❌ Пост пропущено.")
+            state.pop("pending", None)
+            save_state(state)
+
+        elif now - sent_at > timeout:
+            # Таймаут — ніхто не відповів
+            save_published(published, candidate_keys)
+            save_post_log("timeout", chosen_title, post_text, image_url)
+            state["mode"] = "slow"
+            state.pop("pending", None)
+            save_state(state)
+            log.info("Таймаут. Режим → slow.")
+        else:
+            log.info(f"Очікуємо рішення адміна ({(timeout - (now - sent_at)) / 60:.0f} хв залишилось).")
+
+        return  # завжди виходимо після обробки pending
+
+    # ── ФАЗА 2: немає pending — чи час надсилати нове preview? ──────────────
     last_sent = state.get("last_sent") or 0
-
-    # Визначаємо інтервал і таймаут за режимом
-    if mode == "active":
-        interval = MODE_ACTIVE_INTERVAL
-        timeout  = MODE_ACTIVE_TIMEOUT
-    else:
-        interval = MODE_SLOW_INTERVAL
-        timeout  = MODE_SLOW_TIMEOUT
-
-    # Перевіряємо чи час надсилати
     elapsed = now - last_sent
     if elapsed < interval:
         log.info(f"Ще не час. Режим={mode}, залишилось {(interval - elapsed) / 60:.0f} хв.")
         return
 
-    # Збираємо новини
     articles = fetch_recent_news()
     if not articles:
         log.warning("Новин не знайдено.")
@@ -456,8 +492,9 @@ def main():
     post_text = "*" + title + "*" + ("\n" + lines[1] if len(lines) > 1 else "")
 
     chosen_index = result.get("chosen_index", 1) - 1
-    candidates = articles[:TOP_N * 4]
-    log.info(f"Обрана новина: {result.get('chosen_title', '?')}")
+    candidates   = articles[:TOP_N * 4]
+    chosen_title = result.get("chosen_title", "")
+    log.info(f"Обрана новина: {chosen_title}")
 
     image_url = None
     chosen_article = candidates[chosen_index] if 0 <= chosen_index < len(candidates) else None
@@ -465,7 +502,6 @@ def main():
         image_url = chosen_article.get("image")
         if not image_url:
             image_url = fetch_og_image(chosen_article.get("link", ""))
-
     if not image_url:
         image_url = get_fallback_image(result.get("image_keywords", []))
 
@@ -474,42 +510,22 @@ def main():
     if not msg_id:
         return
 
-    # Оновлюємо last_sent перед очікуванням
+    # Зберігаємо кандидатів одразу — щоб не повторювались
+    save_published(published, [article_key(a) for a in candidates])
+
+    # Зберігаємо pending стан і виходимо
     state["last_sent"] = now
+    state["pending"] = {
+        "cb_key":        cb_key,
+        "msg_id":        msg_id,
+        "post_text":     post_text,
+        "image_url":     image_url,
+        "chosen_title":  chosen_title,
+        "sent_at":       now,
+        "candidate_keys": [article_key(a) for a in candidates],
+    }
     save_state(state)
-
-    decision = wait_for_decision(cb_key, timeout)
-
-    chosen_title = result.get("chosen_title", "")
-
-    if decision == "publish":
-        published_ok = publish_to_channel(post_text, image_url)
-        if published_ok:
-            save_published(published, [article_key(a) for a in candidates])
-            save_post_log("published", chosen_title, post_text, image_url)
-            notify_admin("✅ Пост опубліковано в канал!")
-            # Зберігаємо тему щоб не повторювати
-            topics = state.get("published_topics", [])
-            chosen_title = result.get("chosen_title", "")
-            if chosen_title and chosen_title not in topics:
-                topics.insert(0, chosen_title)
-                state["published_topics"] = topics[:20]  # зберігаємо останні 20
-            # Після публікації — повертаємось у active
-            state["mode"] = "active"
-            state["last_approved"] = datetime.now(timezone.utc).timestamp()
-            save_state(state)
-    elif decision == "skip":
-        save_published(published, [article_key(a) for a in candidates])
-        save_post_log("skipped", chosen_title, post_text, image_url)
-        notify_admin("❌ Пост пропущено.")
-    else:
-        # Таймаут — видаляємо preview і переходимо у slow
-        save_published(published, [article_key(a) for a in candidates])
-        save_post_log("timeout", chosen_title, post_text, image_url)
-        new_mode = "slow" if mode == "active" else "slow"
-        state["mode"] = new_mode
-        save_state(state)
-        log.info(f"Таймаут. Режим змінено на: {new_mode}")
+    log.info("Preview надіслано. Чекаємо рішення на наступному запуску.")
 
 
 if __name__ == "__main__":
