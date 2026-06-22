@@ -2,8 +2,8 @@ name: Ukraine News Bot
 
 on:
   schedule:
-    - cron: '0 6,12,18,0 * * *'   # 06:00, 12:00, 18:00, 00:00 UTC (09:00, 15:00, 21:00, 03:00 Kyiv)
-  workflow_dispatch:                 # дозволяє запустити вручну з GitHub
+    - cron: '*/30 * * * *'   # кожні 30 хв; бот сам вирішує чи час публікувати
+  workflow_dispatch:          # ручний запуск з GitHub
 
 jobs:
   run-bot:
@@ -25,8 +25,13 @@ jobs:
       - name: Write config.env
         run: echo "${{ secrets.UN_1_env }}" > config.env
 
-      - name: List files
-        run: ls -la
-
       - name: Run news bot
         run: python news_bot.py
+
+      - name: Save state
+        run: |
+          git config user.email "bot@github-actions"
+          git config user.name "GitHub Actions Bot"
+          git add state.json published.json || true
+          git diff --cached --quiet || git commit -m "bot: update state [skip ci]"
+          git push || true

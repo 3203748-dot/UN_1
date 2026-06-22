@@ -24,9 +24,15 @@ UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
 
 HOURS_BACK      = 6
 TOP_N           = 5
-APPROVAL_TIMEOUT = 30 * 60
 PUBLISHED_LOG   = os.path.join(os.path.dirname(__file__), "published.json")
+STATE_FILE      = os.path.join(os.path.dirname(__file__), "state.json")
 LOG_KEEP_DAYS   = 2
+
+# Режими: active = 90хв інтервал / 30хв таймаут; slow = 3год / 90хв
+MODE_ACTIVE_INTERVAL = 90 * 60
+MODE_ACTIVE_TIMEOUT  = 30 * 60
+MODE_SLOW_INTERVAL   = 3 * 60 * 60
+MODE_SLOW_TIMEOUT    = 90 * 60
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -46,6 +52,22 @@ RSS_FEEDS = [
     ("Hromadske",        "https://hromadske.ua/rss"),
     ("24 Kanal",         "https://24tv.ua/rss/all.xml"),
 ]
+
+
+def load_state():
+    default = {"mode": "active", "last_sent": None, "last_approved": None}
+    if not os.path.exists(STATE_FILE):
+        return default
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return {**default, **json.load(f)}
+    except Exception:
+        return default
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 
 def load_published():
@@ -290,7 +312,15 @@ def send_preview(text, image_url, callback_data):
     return None
 
 
-def wait_for_decision(callback_data, timeout=APPROVAL_TIMEOUT):
+def delete_message(msg_id):
+    try:
+        requests.post(BASE_TG + "/deleteMessage",
+                      json={"chat_id": ADMIN_CHAT_ID, "message_id": msg_id}, timeout=10)
+    except Exception:
+        pass
+
+
+def wait_for_decision(callback_data, timeout):
     log.info("Ochikuyemo rishennya admina (do %d khv)...", timeout // 60)
     offset = None
     deadline = datetime.now(timezone.utc).timestamp() + timeout
@@ -359,6 +389,27 @@ def main():
         log.error("Vidsutni zminni: %s. Perevirte config.env", ", ".join(missing))
         return
 
+    # Завантажуємо стан
+    state = load_state()
+    now = datetime.now(timezone.utc).timestamp()
+    mode = state.get("mode", "active")
+    last_sent = state.get("last_sent") or 0
+
+    # Визначаємо інтервал і таймаут за режимом
+    if mode == "active":
+        interval = MODE_ACTIVE_INTERVAL
+        timeout  = MODE_ACTIVE_TIMEOUT
+    else:
+        interval = MODE_SLOW_INTERVAL
+        timeout  = MODE_SLOW_TIMEOUT
+
+    # Перевіряємо чи час надсилати
+    elapsed = now - last_sent
+    if elapsed < interval:
+        log.info("Sche ne chas. Rezhym=%s, zalyshylось %.0f хв.", mode, (interval - elapsed) / 60)
+        return
+
+    # Збираємо новини
     articles = fetch_recent_news()
     if not articles:
         log.warning("Novyn ne znaideno.")
@@ -390,29 +441,41 @@ def main():
     if chosen_article:
         image_url = chosen_article.get("image")
         if not image_url:
-            log.info("Foto v RSS vidsutne — berymo og:image zi storinky...")
             image_url = fetch_og_image(chosen_article.get("link", ""))
-        if image_url:
-            log.info("Foto znaideno: %s", image_url[:80])
+
     if not image_url:
         image_url = get_fallback_image(result.get("image_keywords", []))
 
-    cb_key = str(int(datetime.now(timezone.utc).timestamp()))
+    cb_key = str(int(now))
     msg_id = send_preview(post_text, image_url, cb_key)
     if not msg_id:
         return
 
-    decision = wait_for_decision(cb_key)
+    # Оновлюємо last_sent перед очікуванням
+    state["last_sent"] = now
+    save_state(state)
+
+    decision = wait_for_decision(cb_key, timeout)
 
     if decision == "publish":
         published_ok = publish_to_channel(post_text, image_url)
         if published_ok:
             save_published(published, [article_key(a) for a in candidates])
             notify_admin("Post opublikovano v kanal!")
+            # Після публікації — повертаємось у active
+            state["mode"] = "active"
+            state["last_approved"] = datetime.now(timezone.utc).timestamp()
+            save_state(state)
     elif decision == "skip":
+        delete_message(msg_id)
         notify_admin("Post propushcheno.")
     else:
-        notify_admin("Chas ochikuvannya vyishov — post ne opublikovano.")
+        # Таймаут — видаляємо preview і переходимо у slow
+        delete_message(msg_id)
+        new_mode = "slow" if mode == "active" else "slow"
+        state["mode"] = new_mode
+        save_state(state)
+        log.info("Timeout. Rezhym zmineno na: %s", new_mode)
 
 
 if __name__ == "__main__":
