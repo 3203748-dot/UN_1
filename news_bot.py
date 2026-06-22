@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Ukraine News Bot — @UN_1_chanel"""
+"""Ukraine News Bot — @UN_1_channel"""
 
 import os, re, json, html, time, logging, sys
 import requests, feedparser
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-# ─── Конфіг ───────────────────────────────────────────────────────────────────
 load_dotenv(os.path.join(os.path.dirname(__file__), "config.env"))
 
+# ─── Config ───────────────────────────────────────────────────────────────────
 TOKEN      = os.getenv("TELEGRAM_TOKEN", "")
 CHANNEL    = os.getenv("TELEGRAM_CHAT_ID", "")
 ADMIN      = os.getenv("ADMIN_CHAT_ID", "")
@@ -16,20 +16,18 @@ CLAUDE_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 TG = f"https://api.telegram.org/bot{TOKEN}"
 
-DIR         = os.path.dirname(__file__)
-STATE_FILE  = os.path.join(DIR, "state.json")
-PUB_FILE    = os.path.join(DIR, "published.json")
-LOG_FILE    = os.path.join(DIR, "posts_log.json")
+DIR        = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(DIR, "state.json")
+PUB_FILE   = os.path.join(DIR, "published.json")
+LOG_FILE   = os.path.join(DIR, "posts_log.json")
 
-HOURS_BACK      = 6
-ACTIVE_INTERVAL = 90 * 60    # між постами в active режимі
-SLOW_INTERVAL   = 3 * 60 * 60
-ACTIVE_TIMEOUT  = 30 * 60    # скільки чекати рішення адміна
-SLOW_TIMEOUT    = 90 * 60
-POLL_MINUTES    = 20          # скільки хв чекати в поточному job
-PUB_KEEP_DAYS   = 3           # скільки днів зберігати published URLs
+ACTIVE_INTERVAL = 90 * 60      # 90 хв між постами (active)
+SLOW_INTERVAL   = 3 * 60 * 60  # 3 год (slow — коли адмін не відповідає)
+POLL_MINUTES    = 20            # скільки хв чекати рішення адміна
+PUB_KEEP_DAYS   = 3             # зберігати URL у published.json N днів
+HOURS_BACK      = 6             # брати новини за останні N год
 
-# Manual run (workflow_dispatch) — ігнорує інтервал між постами
+# Manual run = workflow_dispatch (ігнорує інтервал та pending)
 MANUAL_RUN = os.getenv("MANUAL_RUN", "").lower() == "true"
 
 logging.basicConfig(
@@ -54,20 +52,21 @@ RSS_FEEDS = [
 ]
 
 
-# ─── Стан / файли ─────────────────────────────────────────────────────────────
+# ─── State / Files ────────────────────────────────────────────────────────────
 
 def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {}
+        return {"mode": "active", "last_sent": 0, "recent_events": []}
 
 def save_state(s):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False, indent=2)
 
-def load_published():
+def load_pub():
+    """Завантажує published.json, видаляє старіші за PUB_KEEP_DAYS."""
     try:
         with open(PUB_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -76,7 +75,7 @@ def load_published():
     except Exception:
         return {}
 
-def save_published(data):
+def save_pub(data):
     with open(PUB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
@@ -97,7 +96,7 @@ def write_log(status, title, text="", image=""):
         log.warning(f"write_log: {ex}")
 
 
-# ─── RSS / новини ─────────────────────────────────────────────────────────────
+# ─── RSS / News ───────────────────────────────────────────────────────────────
 
 def extract_image(entry):
     for m in entry.get("media_content", []):
@@ -111,14 +110,13 @@ def extract_image(entry):
     for enc in entry.get("enclosures", []):
         if enc.get("type", "").startswith("image/"):
             return enc.get("href") or enc.get("url")
-    for field in ("summary", "content"):
+    for field in ("content", "summary"):
         text = (entry.get("content") or [{}])[0].get("value", "") if field == "content" \
                else entry.get("summary", "")
         m = re.search(r'<img[^>]+src=["\']([^"\']+\.(?:jpg|jpeg|png|webp))["\']', text, re.I)
         if m:
             return m.group(1)
     return None
-
 
 def fetch_og_image(url):
     if not url:
@@ -153,7 +151,8 @@ def fetch_news():
                     articles.append({
                         "source":  src,
                         "title":   html.unescape(e.get("title", "")).strip(),
-                        "summary": re.sub(r"<[^>]+>", "", html.unescape(e.get("summary", ""))).strip()[:400],
+                        "summary": re.sub(r"<[^>]+>", "", html.unescape(
+                                   e.get("summary", ""))).strip()[:400],
                         "link":    e.get("link", ""),
                         "image":   extract_image(e),
                     })
@@ -165,17 +164,18 @@ def fetch_news():
 
 # ─── Claude ───────────────────────────────────────────────────────────────────
 
-def call_claude(articles, skip_topics):
+def call_claude(articles, recent_events):
     news_text = "\n".join(
         f"{i}. [{a['source']}] {a['title']}\n   {a['summary']}"
         for i, a in enumerate(articles, 1)
     )
     skip_block = ""
-    if skip_topics:
+    if recent_events:
         skip_block = (
-            "ЦІ ПОДІЇ ВЖЕ БУЛИ ОПУБЛІКОВАНІ за останні 24 години — знайди щось ІНШЕ:\n" +
-            "\n".join(f"[{i+1}] {s}" for i, s in enumerate(skip_topics)) +
-            "\n\nВАЖЛИВО: навіть якщо нова стаття про ту саму людину — якщо це ІНША подія, її можна взяти. Але якщо це та САМА подія іншими словами або від іншого джерела — це повтор, не бери.\n\n"
+            "ЦІ ТЕМИ ВЖЕ ВИСВІТЛЕНІ — обери ІНШУ подію:\n" +
+            "\n".join(f"[{i+1}] {s}" for i, s in enumerate(recent_events)) +
+            "\n\nВАЖЛИВО: якщо стаття про ту саму людину, але ІНША подія — можна взяти. "
+            "Якщо та САМА подія іншими словами — це повтор, не бери.\n\n"
         )
 
     prompt = f"""Ти редактор українського Telegram-каналу про політику та війну.
@@ -184,17 +184,17 @@ def call_claude(articles, skip_topics):
 {news_text}
 
 {skip_block}Завдання:
-1. Обери ОДНУ найважливішу статтю про подію, якої ЩЕ НЕ БУЛО в списку вже опублікованих.
+1. Обери ОДНУ найважливішу статтю — нову подію, якої немає в переліку вже висвітлених.
 2. Напиши авторський пост українською мовою:
    - Рядок 1: заголовок з емодзі, обгорни в *зірочки* (до 10 слів)
    - Порожній рядок
    - Абзац 1 (2–3 речення): суть події та контекст
    - Порожній рядок
-   - Абзац 2 (2–3 речення): наслідки та оцінка
-   - БЕЗ посилань, БЕЗ згадок джерел, БЕЗ "за даними ЗМІ"
+   - Абзац 2 (2–3 речення): наслідки або оцінка
+   - БЕЗ посилань, БЕЗ "за даними ЗМІ", БЕЗ згадок джерел
 
-Відповідь ТІЛЬКИ у форматі JSON (без зайвого тексту):
-{{"post_text": "...", "chosen_index": 1, "chosen_title": "заголовок обраної новини"}}"""
+Відповідь ТІЛЬКИ JSON (без зайвого тексту):
+{{"post_text": "...", "chosen_index": 1, "chosen_title": "заголовок обраної статті"}}"""
 
     try:
         r = requests.post(
@@ -215,7 +215,7 @@ def call_claude(articles, skip_topics):
         raw = r.json()["content"][0]["text"].strip()
         m = re.search(r"\{[\s\S]+\}", raw)
         if not m:
-            log.error(f"Claude: no JSON: {raw[:200]}")
+            log.error(f"Claude: no JSON in response: {raw[:300]}")
             return None
         return json.loads(m.group())
     except Exception as ex:
@@ -225,100 +225,85 @@ def call_claude(articles, skip_topics):
 
 # ─── Telegram helpers ─────────────────────────────────────────────────────────
 
-def tg_post(method, **kwargs):
+def tg(method, **kw):
     try:
-        r = requests.post(f"{TG}/{method}", json=kwargs, timeout=20)
+        r = requests.post(f"{TG}/{method}", json=kw, timeout=20)
         return r.json()
     except Exception as ex:
         log.error(f"TG {method}: {ex}")
         return {"ok": False}
+
+def notify(msg):
+    tg("sendMessage", chat_id=ADMIN, text=msg)
 
 def send_preview(text, image_url, cb_key):
     kb = {"inline_keyboard": [[
         {"text": "✅ Опублікувати", "callback_data": f"publish|{cb_key}"},
         {"text": "❌ Пропустити",  "callback_data": f"skip|{cb_key}"},
     ]]}
-    header = "⏳ PREVIEW — очікує погодження\n\n"
+    header = "⏳ *PREVIEW* — очікує погодження\n\n"
 
     # Спроба з фото
     if image_url:
-        r = tg_post("sendPhoto", chat_id=ADMIN, photo=image_url,
-                    caption=header + text, parse_mode="Markdown", reply_markup=kb)
+        r = tg("sendPhoto", chat_id=ADMIN, photo=image_url,
+               caption=header + text, parse_mode="Markdown", reply_markup=kb)
         if r.get("ok"):
-            msg_id = r["result"]["message_id"]
-            log.info(f"Preview надіслано з фото (msg_id={msg_id})")
-            return msg_id
-        log.warning(f"sendPhoto failed ({r.get('description')}) — fallback на текст")
+            log.info(f"Preview (фото) msg_id={r['result']['message_id']}")
+            return r["result"]["message_id"]
+        log.warning(f"sendPhoto failed: {r.get('description')} — fallback текст")
 
-    # Fallback: без фото
-    r = tg_post("sendMessage", chat_id=ADMIN, text=header + text,
-                parse_mode="Markdown", reply_markup=kb)
+    # Fallback без фото
+    r = tg("sendMessage", chat_id=ADMIN, text=header + text,
+           parse_mode="Markdown", reply_markup=kb)
     if r.get("ok"):
-        msg_id = r["result"]["message_id"]
-        log.info(f"Preview надіслано без фото (msg_id={msg_id})")
-        return msg_id
+        log.info(f"Preview (текст) msg_id={r['result']['message_id']}")
+        return r["result"]["message_id"]
 
     log.error(f"send_preview failed: {r}")
     return None
 
 def publish_to_channel(text, image_url):
-    # Спроба з Markdown
+    # З фото
     if image_url:
-        r = tg_post("sendPhoto", chat_id=CHANNEL, photo=image_url,
-                    caption=text, parse_mode="Markdown")
-    else:
-        r = tg_post("sendMessage", chat_id=CHANNEL, text=text, parse_mode="Markdown")
+        r = tg("sendPhoto", chat_id=CHANNEL, photo=image_url,
+               caption=text, parse_mode="Markdown")
+        if r.get("ok"):
+            log.info("Опубліковано з фото")
+            return True
+        log.warning(f"Photo publish failed: {r.get('description')} — fallback текст")
 
-    if r.get("ok"):
-        log.info("publish_to_channel: OK")
-        return True
-
-    log.warning(f"Markdown failed: {r.get('description')} — retry без форматування")
-    # Fallback без Markdown
-    plain = text.replace("*", "").replace("_", "").replace("`", "")
-    if image_url:
-        r = tg_post("sendPhoto", chat_id=CHANNEL, photo=image_url, caption=plain)
-    else:
-        r = tg_post("sendMessage", chat_id=CHANNEL, text=plain)
-
+    # Fallback без Markdown і без фото
+    plain = re.sub(r"[*_`]", "", text)
+    r = tg("sendMessage", chat_id=CHANNEL, text=plain)
     ok = r.get("ok", False)
-    log.info(f"publish_to_channel fallback: ok={ok}, err={r.get('description','')}")
+    if not ok:
+        log.error(f"Text publish failed: {r.get('description')}")
     return ok
 
-def notify_admin(msg):
-    tg_post("sendMessage", chat_id=ADMIN, text=msg)
-
-def get_updates(offset=None, long_poll_secs=0):
-    params = {"timeout": long_poll_secs, "allowed_updates": ["callback_query"]}
+def get_updates(offset=None, long_poll=0):
+    params = {"timeout": long_poll, "allowed_updates": ["callback_query"]}
     if offset is not None:
         params["offset"] = offset
     try:
-        r = requests.get(f"{TG}/getUpdates", params=params,
-                         timeout=long_poll_secs + 10)
+        r = requests.get(f"{TG}/getUpdates", params=params, timeout=long_poll + 15)
         data = r.json()
         if not data.get("ok"):
-            log.error(f"getUpdates not ok: {data.get('description', data)}")
+            log.error(f"getUpdates error: {data.get('description')}")
             return []
         return data.get("result", [])
     except Exception as ex:
         log.warning(f"getUpdates: {ex}")
         return []
 
-def answer_callback(cb_id):
+def answer_cb(cb_id):
     try:
         requests.post(f"{TG}/answerCallbackQuery",
                       json={"callback_query_id": cb_id}, timeout=5)
     except Exception:
         pass
 
-
-# ─── Polling ──────────────────────────────────────────────────────────────────
-
-def poll_for_decision(cb_key, minutes):
-    """
-    Polls Telegram getUpdates для cb_key протягом `minutes` хвилин.
-    Повертає 'publish', 'skip', або None (таймаут).
-    """
+def poll(cb_key, minutes):
+    """Чекає натискання кнопки. Повертає 'publish', 'skip' або None."""
     offset = None
     deadline = time.time() + minutes * 60
     log.info(f"Polling {minutes} хв для cb_key={cb_key!r}")
@@ -328,75 +313,78 @@ def poll_for_decision(cb_key, minutes):
         wait = min(20, remaining)
         if wait <= 0:
             break
-
-        updates = get_updates(offset=offset, long_poll_secs=wait)
-
-        for upd in updates:
+        for upd in get_updates(offset=offset, long_poll=wait):
             offset = upd["update_id"] + 1
             cb = upd.get("callback_query")
             if not cb:
                 continue
             data = cb.get("data", "")
-            answer_callback(cb["id"])
-            log.info(f"Callback отримано: {data!r}")
+            answer_cb(cb["id"])
+            log.info(f"Callback: {data!r}")
             if cb_key in data:
                 action = data.split("|")[0]
                 log.info(f"Рішення: {action}")
                 return action
 
-    log.info("Polling закінчився без рішення")
+    log.info("Polling timeout — рішення не прийнято")
     return None
 
 
-# ─── Pending actions ──────────────────────────────────────────────────────────
+# ─── Publish / Skip ───────────────────────────────────────────────────────────
 
 def do_publish(state):
-    text  = state.get("pending_post_text", "")
-    image = state.get("pending_image_url")
+    text  = state.get("pending_text", "")
+    image = state.get("pending_image")
     title = state.get("pending_title", "")
+
     ok = publish_to_channel(text, image)
     if ok:
         write_log("published", title, text, image or "")
-        topics = state.get("published_topics", [])
-        if title and title not in topics:
-            topics.insert(0, title)
-            state["published_topics"] = topics[:20]
+        _add_recent_event(state, text)
+        state["last_sent"] = time.time()
         state["mode"] = "active"
-        state["last_approved"] = time.time()
-        notify_admin("✅ Пост опубліковано в канал!")
+        notify("✅ Пост опубліковано в канал!")
     else:
-        state["last_sent"] = 0  # скидаємо щоб наступний run спробував знову
-        notify_admin("⚠️ Помилка публікації — перевір логи")
-    clear_pending(state)
+        state["last_sent"] = 0   # скидаємо — наступний run спробує знову
+        notify("⚠️ Помилка публікації — перевір логи")
+
+    _clear_pending(state)
     save_state(state)
 
 def do_skip(state):
     title = state.get("pending_title", "")
+    text  = state.get("pending_text", "")
     write_log("skipped", title)
-    # Зберігаємо суть події при пропуску — щоб не повторювалась
-    post_text = state.get("pending_post_text", "")
-    if post_text:
-        summary = post_text.replace("*", "")[:200]
-        recent = state.get("recent_events", [])
-        recent.insert(0, summary)
-        state["recent_events"] = recent[:16]
-    notify_admin("❌ Пост пропущено.")
-    clear_pending(state)
+    _add_recent_event(state, text)
+    notify("❌ Пост пропущено.")
+    _clear_pending(state)
     save_state(state)
 
-def clear_pending(state):
-    for k in ("pending_cb_key", "pending_post_text", "pending_image_url",
-              "pending_title", "pending_sent_at"):
+def _add_recent_event(state, text):
+    """Додає короткий опис події в recent_events для семантичного dedup."""
+    if not text:
+        return
+    summary = re.sub(r"[*_`]", "", text)[:200]
+    recent = state.get("recent_events", [])
+    # Не додаємо дублікати
+    if recent and recent[0] == summary:
+        return
+    recent.insert(0, summary)
+    state["recent_events"] = recent[:16]
+
+def _clear_pending(state):
+    for k in ("pending_cb_key", "pending_text", "pending_image",
+              "pending_title", "pending_url", "pending_sent_at"):
         state.pop(k, None)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("=" * 50)
-    log.info("Bot start")
+    log.info("=" * 60)
+    log.info(f"Bot start | MANUAL_RUN={MANUAL_RUN}")
 
-    # Перевірка змінних
+    # Перевірка змінних середовища
     for name, val in [("TELEGRAM_TOKEN", TOKEN), ("TELEGRAM_CHAT_ID", CHANNEL),
                       ("ADMIN_CHAT_ID", ADMIN), ("ANTHROPIC_API_KEY", CLAUDE_KEY)]:
         if not val:
@@ -404,20 +392,17 @@ def main():
             return
 
     # ── 1. Видаляємо webhook ────────────────────────────────────────────────
-    # Якщо webhook активний — getUpdates завжди повертає помилку 409
-    # і callbacks від кнопок ніколи не доходять до бота
     try:
         wh = requests.get(f"{TG}/getWebhookInfo", timeout=10).json()
-        wh_url = wh.get("result", {}).get("url", "")
-        if wh_url:
-            log.warning(f"Знайдено активний webhook: {wh_url} — видаляємо!")
+        if wh.get("result", {}).get("url"):
+            log.warning("Webhook активний — видаляємо")
             requests.post(f"{TG}/deleteWebhook",
                           json={"drop_pending_updates": False}, timeout=10)
             log.info("Webhook видалено")
         else:
             log.info("Webhook відсутній — OK")
     except Exception as ex:
-        log.warning(f"Webhook check error: {ex}")
+        log.warning(f"Webhook check: {ex}")
 
     state = load_state()
     now   = time.time()
@@ -426,61 +411,49 @@ def main():
     pending_cb = state.get("pending_cb_key")
     if pending_cb:
         sent_at = state.get("pending_sent_at", 0)
-        mode    = state.get("mode", "active")
-        timeout = ACTIVE_TIMEOUT if mode == "active" else SLOW_TIMEOUT
         elapsed = now - sent_at
-
-        log.info(f"Pending preview: {pending_cb} ({elapsed/60:.0f} хв тому)")
+        log.info(f"Pending preview: {pending_cb} ({elapsed/60:.1f} хв тому)")
 
         if MANUAL_RUN:
-            # Manual run → одразу auto-skip pending і генеруємо нову новину
-            log.info("Manual run: auto-skip pending → генеруємо нову новину")
+            # Manual run: ігноруємо pending, генеруємо новий пост
+            log.info("Manual run — пропускаємо pending, генеруємо нову новину")
             do_skip(state)
             state = load_state()
             # fall through → Phase 3
         else:
-            # Cron run: швидка перевірка — можливо кнопку вже натиснули
-            decision = poll_for_decision(pending_cb, minutes=1)
-
+            # Cron run: перевіряємо чи не натиснули кнопку після минулого run
+            decision = poll(pending_cb, minutes=1)
             if decision == "publish":
                 do_publish(state)
                 return
             elif decision == "skip":
-                log.info("Кнопку 'Пропустити' натиснуто")
                 do_skip(state)
                 state = load_state()
                 # fall through → генеруємо нову новину
             elif elapsed > POLL_MINUTES * 60:
-                # Час вийшов — auto-skip, slow режим
-                log.info(f"Auto-skip: pending {elapsed/60:.0f} хв без рішення → slow режим")
+                # >20 хв без рішення → slow режим (наступний пост через 3 год)
+                log.info(f"Timeout: pending {elapsed/60:.0f} хв без рішення → slow mode")
                 write_log("timeout", state.get("pending_title", ""))
                 state["mode"] = "slow"
-                clear_pending(state)
-                save_state(state)
-                return
-            elif elapsed > timeout:
-                log.info(f"Таймаут {timeout//60} хв — переходимо в slow режим")
-                write_log("timeout", state.get("pending_title", ""))
-                state["mode"] = "slow"
-                clear_pending(state)
+                _clear_pending(state)
                 save_state(state)
                 return
             else:
-                log.info(f"Ще очікуємо рішення (залишилось {(timeout-elapsed)/60:.0f} хв)")
+                log.info(f"Ще очікуємо ({(POLL_MINUTES*60 - elapsed)/60:.1f} хв left)")
                 return
-        # Якщо дійшли сюди — pending знято, генеруємо нову новину нижче
+        # Якщо дійшли сюди — pending знято, генеруємо нову новину
 
-    # ── 3. Перевіряємо інтервал ─────────────────────────────────────────────
-    mode     = state.get("mode", "active")
-    interval = ACTIVE_INTERVAL if mode == "active" else SLOW_INTERVAL
+    # ── 3. Перевіряємо інтервал між постами ────────────────────────────────
+    mode      = state.get("mode", "active")
+    interval  = ACTIVE_INTERVAL if mode == "active" else SLOW_INTERVAL
     last_sent = state.get("last_sent", 0)
     elapsed   = now - last_sent
 
     if not MANUAL_RUN and elapsed < interval:
-        log.info(f"Не час. Режим={mode}, залишилось {(interval-elapsed)/60:.0f} хв")
+        log.info(f"Не час. mode={mode}, залишилось {(interval-elapsed)/60:.0f} хв")
         return
-    if MANUAL_RUN:
-        log.info("Manual run — ігноруємо інтервал")
+
+    log.info(f"Генеруємо пост. mode={mode}, elapsed={elapsed/60:.0f} хв")
 
     # ── 4. Отримуємо новини ─────────────────────────────────────────────────
     articles = fetch_news()
@@ -488,18 +461,27 @@ def main():
         log.warning("Новин не знайдено")
         return
 
-    pub_data    = load_published()
-    new_articles = [a for a in articles if a.get("link") and a["link"] not in pub_data]
-    log.info(f"Після URL-дедуп: {len(new_articles)} нових статей")
+    pub = load_pub()
+    new_articles = [a for a in articles if a.get("link") and a["link"] not in pub]
+    log.info(f"Після URL-dedup: {len(new_articles)}/{len(articles)} статей")
 
     if not new_articles:
-        log.info("Всі свіжі новини вже опубліковані")
-        return
+        log.warning("Всі свіжі статті вже в published.json")
+        # Якщо manual run і нема нових статей — очищаємо published.json
+        # (щоб не застрягти назавжди)
+        if MANUAL_RUN:
+            log.info("Manual run: очищаємо published.json і пробуємо знову")
+            save_pub({})
+            new_articles = [a for a in articles if a.get("link")]
+            if not new_articles:
+                log.warning("Статей взагалі немає")
+                return
+        else:
+            return
 
-    # ── 5. Готуємо контекст вже показаних подій для Claude ─────────────────
+    # ── 5. Claude обирає найважливішу новину ────────────────────────────────
     recent_events = state.get("recent_events", [])
-    skip_topics = recent_events  # передаємо у call_claude
-    result = call_claude(new_articles[:40], skip_topics)
+    result = call_claude(new_articles[:40], recent_events)
     if not result:
         log.error("Claude не повернув результат")
         return
@@ -509,53 +491,53 @@ def main():
     chosen_title = result.get("chosen_title", "")
     log.info(f"Обрано: {chosen_title}")
 
-    # Перший рядок — заголовок, завжди жирний
+    if not post_text:
+        log.error("Claude повернув порожній post_text")
+        return
+
+    # Гарантуємо жирний заголовок
     lines = post_text.split("\n", 1)
     title_clean = lines[0].strip().strip("*").strip()
     post_text = f"*{title_clean}*" + ("\n" + lines[1] if len(lines) > 1 else "")
 
-    # ── 6. Фото ─────────────────────────────────────────────────────────────
-    image_url = None
+    # ── 6. Знаходимо фото ───────────────────────────────────────────────────
     candidates = new_articles[:40]
+    image_url  = None
+    chosen_url = ""
     if 0 <= chosen_index < len(candidates):
-        image_url = candidates[chosen_index].get("image") or \
-                    fetch_og_image(candidates[chosen_index].get("link"))
+        chosen_url = candidates[chosen_index].get("link", "")
+        image_url  = (candidates[chosen_index].get("image") or
+                      fetch_og_image(chosen_url))
 
     # ── 7. Надсилаємо preview адміну ────────────────────────────────────────
     cb_key = str(int(now))
     msg_id = send_preview(post_text, image_url, cb_key)
     if not msg_id:
-        log.error("send_preview failed")
+        log.error("send_preview повністю провалився")
         return
 
-    # ── 8. Зберігаємо стан ДО polling ───────────────────────────────────────
-    # Зберігаємо тільки URL обраної статті — щоб вона не повторилась.
-    # НЕ зберігаємо всі 40 кандидатів, бо наступний run не знайде нових статей.
-    if 0 <= chosen_index < len(candidates):
-        chosen_url = candidates[chosen_index].get("link")
-        if chosen_url:
-            pub_data[chosen_url] = now
-    save_published(pub_data)
+    # ── 8. Зберігаємо стан ─────────────────────────────────────────────────
+    # Тільки URL обраної статті → published.json
+    if chosen_url:
+        pub[chosen_url] = now
+        save_pub(pub)
 
-    # Зберігаємо суть події для наступного запуску
-    recent = state.get("recent_events", [])
-    # Перші 200 символів посту = суть події
-    event_summary = post_text.replace("*", "")[:200]
-    recent.insert(0, event_summary)
-    state["recent_events"] = recent[:16]  # ~24 год при 90-хв інтервалі
+    # recent_events НЕ оновлюємо тут — оновлюємо тільки в do_publish/do_skip
+    # щоб уникнути дублікатів у recent_events
 
     state.update({
-        "last_sent":          now,
-        "pending_cb_key":     cb_key,
-        "pending_post_text":  post_text,
-        "pending_image_url":  image_url,
-        "pending_title":      chosen_title,
-        "pending_sent_at":    now,
+        "last_sent":       now,
+        "pending_cb_key":  cb_key,
+        "pending_text":    post_text,
+        "pending_image":   image_url,
+        "pending_title":   chosen_title,
+        "pending_url":     chosen_url,
+        "pending_sent_at": now,
     })
     save_state(state)
 
     # ── 9. Чекаємо рішення 20 хв ────────────────────────────────────────────
-    decision = poll_for_decision(cb_key, minutes=POLL_MINUTES)
+    decision = poll(cb_key, minutes=POLL_MINUTES)
 
     if decision == "publish":
         do_publish(state)
