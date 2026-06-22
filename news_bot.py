@@ -423,35 +423,42 @@ def main():
 
         log.info(f"Pending preview: {pending_cb} ({elapsed/60:.0f} хв тому)")
 
-        # Швидка перевірка — можливо кнопку вже натиснули після попереднього run
-        decision = poll_for_decision(pending_cb, minutes=1)
-
-        if decision == "publish":
-            do_publish(state)
-            return
-        elif decision == "skip":
-            log.info("Кнопку 'Пропустити' натиснуто")
+        if MANUAL_RUN:
+            # Manual run → одразу auto-skip pending і генеруємо нову новину
+            log.info("Manual run: auto-skip pending → генеруємо нову новину")
             do_skip(state)
             state = load_state()
-            # fall through → генеруємо нову новину
-        elif elapsed > POLL_MINUTES * 60:
-            # Час очікування вийшов — auto-skip, переходимо в slow режим
-            log.info(f"Auto-skip: pending {elapsed/60:.0f} хв без рішення → slow режим")
-            write_log("timeout", state.get("pending_title", ""))
-            state["mode"] = "slow"
-            clear_pending(state)
-            save_state(state)
-            return
-        elif elapsed > timeout:
-            log.info(f"Таймаут {timeout//60} хв — переходимо в slow режим")
-            write_log("timeout", state.get("pending_title", ""))
-            state["mode"] = "slow"
-            clear_pending(state)
-            save_state(state)
-            return
+            # fall through → Phase 3
         else:
-            log.info(f"Ще очікуємо рішення (залишилось {(timeout-elapsed)/60:.0f} хв)")
-            return
+            # Cron run: швидка перевірка — можливо кнопку вже натиснули
+            decision = poll_for_decision(pending_cb, minutes=1)
+
+            if decision == "publish":
+                do_publish(state)
+                return
+            elif decision == "skip":
+                log.info("Кнопку 'Пропустити' натиснуто")
+                do_skip(state)
+                state = load_state()
+                # fall through → генеруємо нову новину
+            elif elapsed > POLL_MINUTES * 60:
+                # Час вийшов — auto-skip, slow режим
+                log.info(f"Auto-skip: pending {elapsed/60:.0f} хв без рішення → slow режим")
+                write_log("timeout", state.get("pending_title", ""))
+                state["mode"] = "slow"
+                clear_pending(state)
+                save_state(state)
+                return
+            elif elapsed > timeout:
+                log.info(f"Таймаут {timeout//60} хв — переходимо в slow режим")
+                write_log("timeout", state.get("pending_title", ""))
+                state["mode"] = "slow"
+                clear_pending(state)
+                save_state(state)
+                return
+            else:
+                log.info(f"Ще очікуємо рішення (залишилось {(timeout-elapsed)/60:.0f} хв)")
+                return
         # Якщо дійшли сюди — pending знято, генеруємо нову новину нижче
 
     # ── 3. Перевіряємо інтервал ─────────────────────────────────────────────
