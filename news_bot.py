@@ -168,8 +168,11 @@ def call_claude(articles, skip_topics):
     )
     skip_block = ""
     if skip_topics:
-        skip_block = "Ці теми вже опубліковані — НЕ повторювати:\n" + \
-                     "\n".join(f"- {t}" for t in skip_topics[:15]) + "\n\n"
+        skip_block = (
+            "ЗАБОРОНЕНІ ТЕМИ (вже були опубліковані або пропущені — СУВОРО НЕ ПОВТОРЮВАТИ):\n" +
+            "\n".join(f"- {t}" for t in skip_topics[:20]) +
+            "\n\nЯкщо серед статей немає іншої важливої теми — вибери найменш схожу на заборонені.\n\n"
+        )
 
     prompt = f"""Ти редактор українського Telegram-каналу про політику та війну.
 
@@ -177,7 +180,8 @@ def call_claude(articles, skip_topics):
 {news_text}
 
 {skip_block}Завдання:
-1. Обери ОДНУ найважливішу НОВУ подію (не з переліку вже опублікованих тем).
+1. Обери ОДНУ найважливішу подію, якої НЕМАЄ в списку заборонених тем.
+   Навіть якщо подія описана іншими словами — це та сама тема, не бери її.
 2. Напиши авторський пост українською мовою:
    - Рядок 1: заголовок з емодзі, обгорни в *зірочки* (до 10 слів)
    - Порожній рядок
@@ -342,6 +346,12 @@ def do_publish(state):
 def do_skip(state):
     title = state.get("pending_title", "")
     write_log("skipped", title)
+    # Зберігаємо тему навіть при пропуску — щоб не повторювалась
+    if title:
+        topics = state.get("published_topics", [])
+        if title not in topics:
+            topics.insert(0, title)
+            state["published_topics"] = topics[:20]
     notify_admin("❌ Пост пропущено.")
     clear_pending(state)
     save_state(state)
