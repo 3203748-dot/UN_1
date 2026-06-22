@@ -345,8 +345,26 @@ def delete_message(msg_id):
 def wait_for_decision(cb_key: str, timeout: int = 25 * 60) -> str:
     """Блокуючий polling до 25 хв. Повертає 'publish'/'skip'/'timeout'."""
     import time
+
+    # Спочатку очищаємо всі старі оновлення щоб не плутались з новими
+    try:
+        resp = requests.get(BASE_TG + "/getUpdates",
+                            params={"timeout": 0, "allowed_updates": ["callback_query"]},
+                            timeout=10)
+        updates = resp.json().get("result", [])
+        if updates:
+            last_id = updates[-1]["update_id"]
+            requests.get(BASE_TG + "/getUpdates",
+                         params={"offset": last_id + 1, "timeout": 0}, timeout=5)
+            offset = last_id + 1
+            log.info(f"Очищено {len(updates)} старих оновлень, offset={offset}")
+        else:
+            offset = None
+    except Exception as e:
+        log.warning(f"Помилка очищення черги: {e}")
+        offset = None
+
     deadline = datetime.now(timezone.utc).timestamp() + timeout
-    offset = None
     while datetime.now(timezone.utc).timestamp() < deadline:
         try:
             params = {"timeout": 20, "allowed_updates": ["callback_query"]}
