@@ -366,7 +366,7 @@ def publish_to_channel(text, image_url=None):
             timeout=20,
         )
     if resp.status_code == 200:
-        log.info("Post opublikovano v kanal!")
+        log.info("Пост опубліковано в канал!")
         return True
     log.error("Telegram error: %s", resp.text[:200])
     return False
@@ -412,20 +412,20 @@ def main():
     # Збираємо новини
     articles = fetch_recent_news()
     if not articles:
-        log.warning("Novyn ne znaideno.")
+        log.warning("Новин не знайдено.")
         return
 
     published = load_published()
     articles = [a for a in articles if article_key(a) not in published]
-    log.info("Pislia filtru dublyiv: %d novykh novyn.", len(articles))
+    log.info(f"Після фільтру дублів: {len(articles)} нових новин.")
     if not articles:
-        log.info("Usi novyny vzhe buly opublikovani.")
+        log.info("Усі новини вже були опубліковані.")
         return
 
     skip_topics = state.get("published_topics", [])
     result = analyze_with_claude(articles, skip_topics)
     if not result:
-        log.error("Claude ne zmih pidhotuvaty post.")
+        log.error("Claude не зміг підготувати пост.")
         return
 
     post_text = result.get("post_text", "")
@@ -435,7 +435,7 @@ def main():
 
     chosen_index = result.get("chosen_index", 1) - 1
     candidates = articles[:TOP_N * 4]
-    log.info("Obrana novyna: %s", result.get("chosen_title", "?"))
+    log.info(f"Обрана новина: {result.get('chosen_title', '?')}")
 
     image_url = None
     chosen_article = candidates[chosen_index] if 0 <= chosen_index < len(candidates) else None
@@ -462,7 +462,7 @@ def main():
         published_ok = publish_to_channel(post_text, image_url)
         if published_ok:
             save_published(published, [article_key(a) for a in candidates])
-            notify_admin("Post opublikovano v kanal!")
+            notify_admin("✅ Пост опубліковано в канал!")
             # Зберігаємо тему щоб не повторювати
             topics = state.get("published_topics", [])
             chosen_title = result.get("chosen_title", "")
@@ -474,10 +474,11 @@ def main():
             state["last_approved"] = datetime.now(timezone.utc).timestamp()
             save_state(state)
     elif decision == "skip":
-        delete_message(msg_id)
-        notify_admin("Post propushcheno.")
+        save_published(published, [article_key(a) for a in candidates])
+        notify_admin("❌ Пост пропущено.")
     else:
         # Таймаут — видаляємо preview і переходимо у slow
+        save_published(published, [article_key(a) for a in candidates])
         delete_message(msg_id)
         new_mode = "slow" if mode == "active" else "slow"
         state["mode"] = new_mode
