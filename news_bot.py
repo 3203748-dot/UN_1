@@ -284,8 +284,8 @@ def get_fallback_image(keywords):
 def send_preview(text, image_url, callback_data):
     keyboard = {
         "inline_keyboard": [[
-            {"text": "Opublikuvaty", "callback_data": "publish|" + callback_data},
-            {"text": "Propustyty",   "callback_data": "skip|" + callback_data},
+            {"text": "✅ Опублікувати", "callback_data": "publish|" + callback_data},
+            {"text": "❌ Пропустити",  "callback_data": "skip|" + callback_data},
         ]]
     }
     header = "PREVIEW - ochikuye pohodzhennya\n\n"
@@ -479,7 +479,6 @@ def main():
     else:
         # Таймаут — видаляємо preview і переходимо у slow
         save_published(published, [article_key(a) for a in candidates])
-        delete_message(msg_id)
         new_mode = "slow" if mode == "active" else "slow"
         state["mode"] = new_mode
         save_state(state)
