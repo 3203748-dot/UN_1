@@ -29,6 +29,9 @@ SLOW_TIMEOUT    = 90 * 60
 POLL_MINUTES    = 20          # скільки хв чекати в поточному job
 PUB_KEEP_DAYS   = 3           # скільки днів зберігати published URLs
 
+# Manual run (workflow_dispatch) — ігнорує інтервал між постами
+MANUAL_RUN = os.getenv("MANUAL_RUN", "").lower() == "true"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -425,19 +428,31 @@ def main():
 
         if decision == "publish":
             do_publish(state)
+            return
         elif decision == "skip":
+            log.info("Кнопку 'Пропустити' натиснуто")
             do_skip(state)
+            state = load_state()
+            # fall through → генеруємо нову новину
+        elif elapsed > POLL_MINUTES * 60:
+            # Час очікування вийшов — auto-skip, переходимо в slow режим
+            log.info(f"Auto-skip: pending {elapsed/60:.0f} хв без рішення → slow режим")
+            write_log("timeout", state.get("pending_title", ""))
+            state["mode"] = "slow"
+            clear_pending(state)
+            save_state(state)
+            return
         elif elapsed > timeout:
             log.info(f"Таймаут {timeout//60} хв — переходимо в slow режим")
             write_log("timeout", state.get("pending_title", ""))
             state["mode"] = "slow"
             clear_pending(state)
             save_state(state)
+            return
         else:
             log.info(f"Ще очікуємо рішення (залишилось {(timeout-elapsed)/60:.0f} хв)")
-            save_state(state)
-
-        return  # поки є pending — нову новину не генеруємо
+            return
+        # Якщо дійшли сюди — pending знято, генеруємо нову новину нижче
 
     # ── 3. Перевіряємо інтервал ─────────────────────────────────────────────
     mode     = state.get("mode", "active")
@@ -445,9 +460,11 @@ def main():
     last_sent = state.get("last_sent", 0)
     elapsed   = now - last_sent
 
-    if elapsed < interval:
+    if not MANUAL_RUN and elapsed < interval:
         log.info(f"Не час. Режим={mode}, залишилось {(interval-elapsed)/60:.0f} хв")
         return
+    if MANUAL_RUN:
+        log.info("Manual run — ігноруємо інтервал")
 
     # ── 4. Отримуємо новини ─────────────────────────────────────────────────
     articles = fetch_news()
