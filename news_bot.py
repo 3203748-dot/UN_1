@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-Telegram News Bot — Політика / Україна
-Збирає новини за останні 6 годин, аналізує через Claude API,
-надсилає preview адміну на погодження, потім публікує в канал.
-"""
+"""Telegram News Bot - Polityka / Ukraina"""
 
 import os
 import re
@@ -15,48 +11,44 @@ import feedparser
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-# Завантажуємо config.env якщо є (локальний запуск), в GitHub Actions — змінні середовища
-_env_path = os.path.join(os.path.dirname(__file__), "config.env")
-if os.path.exists(_env_path):
-    load_dotenv(_env_path)
+env_path = os.path.join(os.path.dirname(__file__), "config.env")
+if os.path.exists(env_path):
+    load_dotenv(env_path)
 
-# ── Налаштування ─────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-ADMIN_CHAT_ID     = os.getenv("ADMIN_CHAT_ID")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-PIXABAY_API_KEY   = os.getenv("PIXABAY_API_KEY", "")
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+ADMIN_CHAT_ID      = os.getenv("ADMIN_CHAT_ID")
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY")
+PIXABAY_API_KEY    = os.getenv("PIXABAY_API_KEY", "")
 UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
 
-HOURS_BACK       = 6
-TOP_N            = 5
+HOURS_BACK      = 6
+TOP_N           = 5
 APPROVAL_TIMEOUT = 30 * 60
-PUBLISHED_LOG    = os.path.join(os.path.dirname(__file__), "published.json")
-LOG_KEEP_DAYS    = 2
+PUBLISHED_LOG   = os.path.join(os.path.dirname(__file__), "published.json")
+LOG_KEEP_DAYS   = 2
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── RSS-джерела ───────────────────────────────────────────────────────────────
+BASE_TG = "https://api.telegram.org/bot" + (TELEGRAM_TOKEN or "")
+
 RSS_FEEDS = [
-    ("Укрінформ",         "https://www.ukrinform.ua/rss/block-lastnews"),
-    ("Радіо Свобода",     "https://www.radiosvoboda.org/api/zymqdmspry"),
-    ("Суспільне",         "https://suspilne.media/rss/ukraine.rss"),
-    ("LB.ua",             "https://lb.ua/rss/ukraine.xml"),
-    ("Babel",             "https://babel.ua/rss"),
-    ("Українська правда", "https://www.pravda.com.ua/rss/view_news/"),
-    ("УНІАН",             "https://rss.unian.net/site/news_ukr.rss"),
-    ("Дзеркало тижня",   "https://zn.ua/rss/politics.html"),
-    ("NV",                "https://nv.ua/rss/ukraine.xml"),
-    ("Громадське",        "https://hromadske.ua/rss"),
-    ("24 канал",          "https://24tv.ua/rss/all.xml"),
+    ("Ukrinform",        "https://www.ukrinform.ua/rss/block-lastnews"),
+    ("Radio Svoboda",    "https://www.radiosvoboda.org/api/zymqdmspry"),
+    ("Suspilne",         "https://suspilne.media/rss/ukraine.rss"),
+    ("LB.ua",            "https://lb.ua/rss/ukraine.xml"),
+    ("Babel",            "https://babel.ua/rss"),
+    ("Ukrainska Pravda", "https://www.pravda.com.ua/rss/view_news/"),
+    ("UNIAN",            "https://rss.unian.net/site/news_ukr.rss"),
+    ("Dzerkalo Tyzhnia", "https://zn.ua/rss/politics.html"),
+    ("NV",               "https://nv.ua/rss/ukraine.xml"),
+    ("Hromadske",        "https://hromadske.ua/rss"),
+    ("24 Kanal",         "https://24tv.ua/rss/all.xml"),
 ]
 
-BASE_TG = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-
-# ── Журнал опублікованих новин ───────────────────────────────────────────────
-def load_published() -> set:
+def load_published():
     if not os.path.exists(PUBLISHED_LOG):
         return set()
     try:
@@ -67,7 +59,8 @@ def load_published() -> set:
     except Exception:
         return set()
 
-def save_published(published: set, keys: list):
+
+def save_published(published, keys):
     data = {}
     if os.path.exists(PUBLISHED_LOG):
         try:
@@ -84,12 +77,12 @@ def save_published(published: set, keys: list):
     with open(PUBLISHED_LOG, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
-def article_key(article: dict) -> str:
+
+def article_key(article):
     return article.get("link") or article.get("title", "")
 
 
-# ── Витяг зображення з RSS-запису ────────────────────────────────────────────
-def extract_image(entry) -> str | None:
+def extract_image(entry):
     for m in entry.get("media_content", []):
         url = m.get("url", "")
         if url and any(url.lower().endswith(e) for e in (".jpg", ".jpeg", ".png", ".webp")):
@@ -102,7 +95,6 @@ def extract_image(entry) -> str | None:
         if enc.get("type", "").startswith("image/"):
             return enc.get("href") or enc.get("url")
     for field in ("summary", "content"):
-        text = ""
         if field == "content":
             cl = entry.get("content", [])
             text = cl[0].get("value", "") if cl else ""
@@ -114,8 +106,7 @@ def extract_image(entry) -> str | None:
     return None
 
 
-# ── Витяг og:image зі сторінки статті ────────────────────────────────────────
-def fetch_og_image(url: str) -> str | None:
+def fetch_og_image(url):
     if not url:
         return None
     try:
@@ -130,12 +121,11 @@ def fetch_og_image(url: str) -> str | None:
         if match:
             return match.group(1)
     except Exception as e:
-        log.warning(f"og:image error [{url[:60]}]: {e}")
+        log.warning("og:image error [%s]: %s", url[:60], e)
     return None
 
 
-# ── Збір новин ────────────────────────────────────────────────────────────────
-def fetch_recent_news(hours_back: int = HOURS_BACK) -> list[dict]:
+def fetch_recent_news(hours_back=HOURS_BACK):
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
     articles = []
     for source_name, url in RSS_FEEDS:
@@ -160,48 +150,55 @@ def fetch_recent_news(hours_back: int = HOURS_BACK) -> list[dict]:
                         "image":   extract_image(entry),
                     })
         except Exception as e:
-            log.warning(f"RSS error [{source_name}]: {e}")
+            log.warning("RSS error [%s]: %s", source_name, e)
     articles.sort(key=lambda x: x["pub"], reverse=True)
-    log.info(f"Знайдено {len(articles)} новин за {hours_back} год.")
+    log.info("Znaideno %d novyn za %d hod.", len(articles), hours_back)
     return articles
 
 
-# ── Claude API ────────────────────────────────────────────────────────────────
-def analyze_with_claude(articles: list[dict], skip_topics: list[str] = []) -> dict | None:
+def build_prompt(news_text, skip_topics):
+    lines = [
+        "Ty redaktor ukrayinskoho Telegram-kanalu pro polityku ta Ukrayinu.",
+        "",
+        "Ось нові статті за останні " + str(HOURS_BACK) + " годин:",
+        "",
+        news_text,
+    ]
+    if skip_topics:
+        lines.append("Ці теми вже були опубліковані — НЕ повторюй їх:")
+        for t in skip_topics[:10]:
+            lines.append("- " + t)
+        lines.append("")
+    lines += [
+        "Завдання:",
+        "1. Проаналізуй ВСІ наведені новини і визнач ОДНУ найважливішу НОВУ подію.",
+        "2. Напиши авторський пост для Telegram українською мовою:",
+        "   - Заголовок: влучний, інтригуючий (до 10 слів), з емодзі на початку, обгорни його в *зірочки*",
+        "   - Основний текст: 2 абзаци по 2-3 речення, розділені порожнім рядком",
+        "   - Перший абзац: суть події та контекст",
+        "   - Другий абзац: наслідки та оцінка",
+        "   - НЕ копіюй формулювання з джерел, пиши як журналіст-аналітик",
+        "   - БЕЗ будь-яких посилань, згадок джерел чи URL у тексті",
+        '   - Жодних "за даними ЗМІ", "як повідомляє" тощо',
+        "",
+        "Відповідь СТРОГО у форматі JSON:",
+        '{"post_text": "повний текст поста з емодзі, без посилань", "chosen_index": 1, "chosen_title": "заголовок обраної новини"}',
+    ]
+    return "\n".join(lines)
+
+
+def analyze_with_claude(articles, skip_topics=None):
     if not articles:
         return None
+    if skip_topics is None:
+        skip_topics = []
 
     candidates = articles[:TOP_N * 4]
     news_text = ""
     for i, a in enumerate(candidates, 1):
-        news_text += f"{i}. [{a['source']}] {a['title']}\n   {a['summary']}\n\n"
+        news_text += str(i) + ". [" + a["source"] + "] " + a["title"] + "\n   " + a["summary"] + "\n\n"
 
-    skip_block = ""
-    if skip_topics:
-        skip_block = "Ці теми вже були опубліковані — НЕ повторюй їх:\n"
-        skip_block += "\n".join("- " + t for t in skip_topics[:10])
-        skip_block += "\n\n"
-
-    prompt = (
-        "Ти редактор українського Telegram-каналу про політику та Україну.\n\n"
-        "Ось нові статті за останні " + str(HOURS_BACK) + " годин:\n\n"
-        + news_text + "\n"
-        + skip_block
-        + "Завдання:\n"
-        "1. Проаналізуй ВСІ наведені новини і визнач ОДНУ найважливішу НОВУ подію.\n"
-        "2. Напиши авторський пост для Telegram українською мовою:\n"
-        "   - Заголовок: влучний, інтригуючий (до 10 слів), з емодзі на початку, обгорни його в *зірочки* для жирного тексту\n"
-        "   - Основний текст: 2 абзаци по 2-3 речення, розділені порожнім рядком\n"
-        "   - Перший абзац: суть події та контекст\n"
-        "   - Другий абзац: наслідки та оцінка\n"
-        "   - НЕ копіюй формулювання з джерел, пиши як журналіст-аналітик\n"
-        "   - БЕЗ будь-яких посилань, згадок джерел чи URL у тексті\n"
-        '   - Жодних "за даними ЗМІ", "як повідомляє" тощо\n\n'
-        "Відповідь СТРОГО у форматі JSON:\n"
-        '{"post_text": "повний текст поста з емодзі, без посилань", '
-        '"chosen_index": 1, '
-        '"chosen_title": "заголовок обраної новини"}'
-    )
+    prompt = build_prompt(news_text, skip_topics)
 
     try:
         resp = requests.post(
@@ -222,16 +219,15 @@ def analyze_with_claude(articles: list[dict], skip_topics: list[str] = []) -> di
         raw = resp.json()["content"][0]["text"].strip()
         match = re.search(r"\{[\s\S]+\}", raw)
         if not match:
-            log.error(f"Claude не повернув JSON: {raw[:300]}")
+            log.error("Claude ne povernuv JSON: %s", raw[:300])
             return None
         return json.loads(match.group())
     except Exception as e:
-        log.error(f"Claude API error: {e}")
+        log.error("Claude API error: %s", e)
         return None
 
 
-# ── Пошук резервного зображення ──────────────────────────────────────────────
-def get_fallback_image(keywords: list[str]) -> str | None:
+def get_fallback_image(keywords):
     if not keywords:
         return None
     query = " ".join(keywords[:2])
@@ -248,78 +244,63 @@ def get_fallback_image(keywords: list[str]) -> str | None:
             if hits:
                 return hits[0].get("largeImageURL")
         except Exception as e:
-            log.warning(f"Pixabay error: {e}")
+            log.warning("Pixabay error: %s", e)
     if UNSPLASH_ACCESS_KEY:
         try:
             resp = requests.get(
                 "https://api.unsplash.com/photos/random",
                 params={"query": query, "orientation": "landscape"},
-                headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"},
+                headers={"Authorization": "Client-ID " + UNSPLASH_ACCESS_KEY},
                 timeout=10,
             )
             return resp.json().get("urls", {}).get("regular")
         except Exception as e:
-            log.warning(f"Unsplash error: {e}")
+            log.warning("Unsplash error: %s", e)
     return None
 
 
-# ── Надіслати preview адміну з кнопками ──────────────────────────────────────
-def send_preview(text: str, image_url: str | None, callback_data: str) -> int | None:
+def send_preview(text, image_url, callback_data):
     keyboard = {
         "inline_keyboard": [[
-            {"text": "✅ Опублікувати", "callback_data": f"publish|{callback_data}"},
-            {"text": "❌ Пропустити",   "callback_data": f"skip|{callback_data}"},
+            {"text": "Opublikuvaty", "callback_data": "publish|" + callback_data},
+            {"text": "Propustyty",   "callback_data": "skip|" + callback_data},
         ]]
     }
-    header = "👁 *PREVIEW — очікує погодження*\n\n"
-
+    header = "PREVIEW - ochikuye pohodzhennya\n\n"
     if image_url:
         resp = requests.post(
-            f"{BASE_TG}/sendPhoto",
-            json={
-                "chat_id": ADMIN_CHAT_ID,
-                "photo": image_url,
-                "caption": header + text,
-                "parse_mode": "Markdown",
-                "reply_markup": keyboard,
-            },
+            BASE_TG + "/sendPhoto",
+            json={"chat_id": ADMIN_CHAT_ID, "photo": image_url,
+                  "caption": header + text, "parse_mode": "Markdown",
+                  "reply_markup": keyboard},
             timeout=20,
         )
     else:
         resp = requests.post(
-            f"{BASE_TG}/sendMessage",
-            json={
-                "chat_id": ADMIN_CHAT_ID,
-                "text": header + text,
-                "parse_mode": "Markdown",
-                "reply_markup": keyboard,
-            },
+            BASE_TG + "/sendMessage",
+            json={"chat_id": ADMIN_CHAT_ID, "text": header + text,
+                  "parse_mode": "Markdown", "reply_markup": keyboard},
             timeout=20,
         )
-
     if resp.status_code == 200:
         msg_id = resp.json()["result"]["message_id"]
-        log.info(f"Preview надіслано адміну (msg_id={msg_id})")
+        log.info("Preview nadislano adminu (msg_id=%s)", msg_id)
         return msg_id
-    else:
-        log.error(f"Помилка надсилання preview: {resp.text[:200]}")
-        return None
+    log.error("Pomylka nadislannya preview: %s", resp.text[:200])
+    return None
 
 
-# ── Очікування рішення адміна ─────────────────────────────────────────────────
-def wait_for_decision(callback_data: str, timeout: int = APPROVAL_TIMEOUT) -> str:
-    log.info(f"Очікуємо рішення адміна (до {timeout // 60} хв)...")
+def wait_for_decision(callback_data, timeout=APPROVAL_TIMEOUT):
+    log.info("Ochikuyemo rishennya admina (do %d khv)...", timeout // 60)
     offset = None
     deadline = datetime.now(timezone.utc).timestamp() + timeout
-
     while datetime.now(timezone.utc).timestamp() < deadline:
         try:
             params = {"timeout": 30, "allowed_updates": ["callback_query"]}
             if offset:
                 params["offset"] = offset
-            resp = requests.get(f"{BASE_TG}/getUpdates", params=params, timeout=40)
+            resp = requests.get(BASE_TG + "/getUpdates", params=params, timeout=40)
             updates = resp.json().get("result", [])
-
             for upd in updates:
                 offset = upd["update_id"] + 1
                 cb = upd.get("callback_query")
@@ -328,52 +309,46 @@ def wait_for_decision(callback_data: str, timeout: int = APPROVAL_TIMEOUT) -> st
                 data = cb.get("data", "")
                 if callback_data not in data:
                     continue
-                requests.post(f"{BASE_TG}/answerCallbackQuery",
+                requests.post(BASE_TG + "/answerCallbackQuery",
                               json={"callback_query_id": cb["id"]}, timeout=5)
                 action = data.split("|")[0]
-                log.info(f"Рішення адміна: {action}")
+                log.info("Rishennya admina: %s", action)
                 return action
-
         except Exception as e:
-            log.warning(f"Polling error: {e}")
-
-    log.warning("Час очікування вийшов — пост пропущено.")
+            log.warning("Polling error: %s", e)
+    log.warning("Chas ochikuvannya vyishov.")
     return "timeout"
 
 
-# ── Публікація в канал ────────────────────────────────────────────────────────
-def publish_to_channel(text: str, image_url: str | None = None) -> bool:
+def publish_to_channel(text, image_url=None):
     if image_url:
         resp = requests.post(
-            f"{BASE_TG}/sendPhoto",
+            BASE_TG + "/sendPhoto",
             json={"chat_id": TELEGRAM_CHAT_ID, "photo": image_url,
                   "caption": text, "parse_mode": "Markdown"},
             timeout=20,
         )
     else:
         resp = requests.post(
-            f"{BASE_TG}/sendMessage",
+            BASE_TG + "/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
                   "parse_mode": "Markdown"},
             timeout=20,
         )
     if resp.status_code == 200:
-        log.info("✅ Пост опубліковано в канал!")
+        log.info("Post opublikovano v kanal!")
         return True
-    log.error(f"Telegram error: {resp.text[:200]}")
+    log.error("Telegram error: %s", resp.text[:200])
     return False
 
 
-# ── Повідомити адміна про результат ──────────────────────────────────────────
-def notify_admin(text: str):
-    requests.post(f"{BASE_TG}/sendMessage",
+def notify_admin(text):
+    requests.post(BASE_TG + "/sendMessage",
                   json={"chat_id": ADMIN_CHAT_ID, "text": text}, timeout=10)
 
 
-# ── Головна функція ───────────────────────────────────────────────────────────
 def main():
-    log.info("=== News Bot запущено ===")
-
+    log.info("=== News Bot zapushcheno ===")
     missing = [k for k, v in {
         "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
         "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
@@ -381,71 +356,63 @@ def main():
         "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
     }.items() if not v]
     if missing:
-        log.error(f"Відсутні змінні: {', '.join(missing)}. Перевір config.env")
+        log.error("Vidsutni zminni: %s. Perevirte config.env", ", ".join(missing))
         return
 
-    # 1. Збір новин
     articles = fetch_recent_news()
     if not articles:
-        log.warning("Новин не знайдено.")
+        log.warning("Novyn ne znaideno.")
         return
 
     published = load_published()
     articles = [a for a in articles if article_key(a) not in published]
-    log.info(f"Після фільтру дублів: {len(articles)} нових новин.")
+    log.info("Pislia filtru dublyiv: %d novykh novyn.", len(articles))
     if not articles:
-        log.info("Усі новини вже були опубліковані. Пропускаємо.")
+        log.info("Usi novyny vzhe buly opublikovani.")
         return
 
-    # 2. Аналіз через Claude
     result = analyze_with_claude(articles)
     if not result:
-        log.error("Claude не зміг підготувати пост.")
+        log.error("Claude ne zmih pidhotuvaty post.")
         return
 
-    post_text    = result.get("post_text", "")
+    post_text = result.get("post_text", "")
     lines = post_text.split("\n", 1)
     title = lines[0].strip("* ")
-    post_text = f"*{title}*" + ("\n" + lines[1] if len(lines) > 1 else "")
-    chosen_index = result.get("chosen_index", 1) - 1
-    candidates   = articles[:TOP_N * 4]
-    log.info(f"Обрана новина: {result.get('chosen_title', '?')}")
+    post_text = "*" + title + "*" + ("\n" + lines[1] if len(lines) > 1 else "")
 
-    # 3. Зображення
+    chosen_index = result.get("chosen_index", 1) - 1
+    candidates = articles[:TOP_N * 4]
+    log.info("Obrana novyna: %s", result.get("chosen_title", "?"))
+
     image_url = None
     chosen_article = candidates[chosen_index] if 0 <= chosen_index < len(candidates) else None
-
     if chosen_article:
         image_url = chosen_article.get("image")
         if not image_url:
-            log.info("Фото в RSS відсутнє — беремо og:image зі сторінки...")
+            log.info("Foto v RSS vidsutne — berymo og:image zi storinky...")
             image_url = fetch_og_image(chosen_article.get("link", ""))
         if image_url:
-            log.info(f"Фото знайдено: {image_url[:80]}")
-
+            log.info("Foto znaideno: %s", image_url[:80])
     if not image_url:
-        log.info("og:image не знайдено — шукаємо резервне...")
         image_url = get_fallback_image(result.get("image_keywords", []))
 
-    # 4. Preview адміну
     cb_key = str(int(datetime.now(timezone.utc).timestamp()))
     msg_id = send_preview(post_text, image_url, cb_key)
     if not msg_id:
         return
 
-    # 5. Чекати рішення
     decision = wait_for_decision(cb_key)
 
     if decision == "publish":
         published_ok = publish_to_channel(post_text, image_url)
         if published_ok:
-            all_keys = [article_key(a) for a in candidates]
-            save_published(published, all_keys)
-            notify_admin("✅ Пост опубліковано в канал!")
+            save_published(published, [article_key(a) for a in candidates])
+            notify_admin("Post opublikovano v kanal!")
     elif decision == "skip":
-        notify_admin("⏭ Пост пропущено.")
+        notify_admin("Post propushcheno.")
     else:
-        notify_admin("⏰ Час очікування вийшов — пост не опубліковано.")
+        notify_admin("Chas ochikuvannya vyishov — post ne opublikovano.")
 
 
 if __name__ == "__main__":
