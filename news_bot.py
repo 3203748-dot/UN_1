@@ -353,6 +353,7 @@ def do_publish(state):
         state["last_approved"] = time.time()
         notify_admin("✅ Пост опубліковано в канал!")
     else:
+        state["last_sent"] = 0  # скидаємо щоб наступний run спробував знову
         notify_admin("⚠️ Помилка публікації — перевір логи")
     clear_pending(state)
     save_state(state)
