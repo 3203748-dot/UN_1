@@ -342,28 +342,35 @@ def delete_message(msg_id):
         pass
 
 
-def check_pending_decision(cb_key: str):
-    """Перевіряє getUpdates ОДИН РАЗ (без очікування). Повертає 'publish'/'skip'/None."""
+def check_pending_decision(cb_key: str, state: dict):
+    """Перевіряє getUpdates ОДИН РАЗ. Зберігає offset в state. Повертає 'publish'/'skip'/None."""
     try:
-        resp = requests.get(
-            BASE_TG + "/getUpdates",
-            params={"timeout": 0, "allowed_updates": ["callback_query"]},
-            timeout=10,
-        )
+        params = {"timeout": 0, "allowed_updates": ["callback_query"]}
+        offset = state.get("tg_offset")
+        if offset:
+            params["offset"] = offset
+
+        resp = requests.get(BASE_TG + "/getUpdates", params=params, timeout=10)
         updates = resp.json().get("result", [])
+
+        result = None
         for upd in updates:
+            # Зсуваємо offset вперед для кожного оновлення
+            state["tg_offset"] = upd["update_id"] + 1
+
             cb = upd.get("callback_query")
             if not cb:
                 continue
             data = cb.get("data", "")
-            if cb_key not in data:
-                continue
+
+            # Відповідаємо на callback щоб кнопка не "крутилась"
             requests.post(BASE_TG + "/answerCallbackQuery",
                           json={"callback_query_id": cb["id"]}, timeout=5)
-            # Споживаємо оновлення щоб не читати повторно
-            requests.get(BASE_TG + "/getUpdates",
-                         params={"offset": upd["update_id"] + 1, "timeout": 0}, timeout=5)
-            return data.split("|")[0]
+
+            if cb_key in data and result is None:
+                result = data.split("|")[0]
+
+        return result
     except Exception as e:
         log.warning(f"Помилка перевірки callback: {e}")
     return None
@@ -418,7 +425,7 @@ def main():
     pending = state.get("pending")
     if pending:
         cb_key   = pending["cb_key"]
-        decision = check_pending_decision(cb_key)
+        decision = check_pending_decision(cb_key, state)
         sent_at  = pending.get("sent_at", 0)
         post_text    = pending["post_text"]
         image_url    = pending.get("image_url")
@@ -458,6 +465,7 @@ def main():
             log.info("Таймаут. Режим → slow.")
         else:
             log.info(f"Очікуємо рішення адміна ({(timeout - (now - sent_at)) / 60:.0f} хв залишилось).")
+            save_state(state)  # зберігаємо оновлений tg_offset
 
         return  # завжди виходимо після обробки pending
 
