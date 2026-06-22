@@ -239,16 +239,25 @@ def send_preview(text, image_url, cb_key):
         {"text": "❌ Пропустити",  "callback_data": f"skip|{cb_key}"},
     ]]}
     header = "⏳ PREVIEW — очікує погодження\n\n"
+
+    # Спроба з фото
     if image_url:
         r = tg_post("sendPhoto", chat_id=ADMIN, photo=image_url,
                     caption=header + text, parse_mode="Markdown", reply_markup=kb)
-    else:
-        r = tg_post("sendMessage", chat_id=ADMIN, text=header + text,
-                    parse_mode="Markdown", reply_markup=kb)
+        if r.get("ok"):
+            msg_id = r["result"]["message_id"]
+            log.info(f"Preview надіслано з фото (msg_id={msg_id})")
+            return msg_id
+        log.warning(f"sendPhoto failed ({r.get('description')}) — fallback на текст")
+
+    # Fallback: без фото
+    r = tg_post("sendMessage", chat_id=ADMIN, text=header + text,
+                parse_mode="Markdown", reply_markup=kb)
     if r.get("ok"):
         msg_id = r["result"]["message_id"]
-        log.info(f"Preview надіслано (msg_id={msg_id})")
+        log.info(f"Preview надіслано без фото (msg_id={msg_id})")
         return msg_id
+
     log.error(f"send_preview failed: {r}")
     return None
 
