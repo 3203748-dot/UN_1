@@ -36,8 +36,6 @@ jobs:
           git pull --rebase origin main || true
 
       - name: Run bot
-        env:
-          MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' }}
         run: python news_bot.py
 
       - name: Save state
