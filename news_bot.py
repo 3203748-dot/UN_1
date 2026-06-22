@@ -520,10 +520,12 @@ def main():
         return
 
     # ── 8. Зберігаємо стан ДО polling ───────────────────────────────────────
-    # (щоб при kill/timeout новини не повторювались)
-    for a in candidates:
-        if a.get("link"):
-            pub_data[a["link"]] = now
+    # Зберігаємо тільки URL обраної статті — щоб вона не повторилась.
+    # НЕ зберігаємо всі 40 кандидатів, бо наступний run не знайде нових статей.
+    if 0 <= chosen_index < len(candidates):
+        chosen_url = candidates[chosen_index].get("link")
+        if chosen_url:
+            pub_data[chosen_url] = now
     save_published(pub_data)
 
     # Зберігаємо суть події для наступного запуску
