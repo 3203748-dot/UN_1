@@ -38,6 +38,6 @@ jobs:
         run: |
           git config user.email "bot@github-actions"
           git config user.name "GitHub Actions Bot"
-          git add state.json published.json || true
+          git add state.json published.json posts_log.json || true
           git diff --cached --quiet || git commit -m "bot: update state [skip ci]"
           git push || true

@@ -25,6 +25,7 @@ UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
 HOURS_BACK      = 6
 TOP_N           = 5
 PUBLISHED_LOG   = os.path.join(os.path.dirname(__file__), "published.json")
+POSTS_LOG       = os.path.join(os.path.dirname(__file__), "posts_log.json")
 STATE_FILE      = os.path.join(os.path.dirname(__file__), "state.json")
 LOG_KEEP_DAYS   = 2
 
@@ -98,6 +99,27 @@ def save_published(published, keys):
             data[key] = now
     with open(PUBLISHED_LOG, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
+
+
+def save_post_log(status: str, title: str, text: str, image_url: str | None):
+    """Зберігає запис у журнал постів (posts_log.json)."""
+    try:
+        log_data = []
+        if os.path.exists(POSTS_LOG):
+            with open(POSTS_LOG, "r", encoding="utf-8") as f:
+                log_data = json.load(f)
+        log_data.insert(0, {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "status": status,   # "published" / "skipped" / "timeout"
+            "title": title,
+            "text": text,
+            "image": image_url or "",
+        })
+        log_data = log_data[:100]  # зберігаємо останні 100
+        with open(POSTS_LOG, "w", encoding="utf-8") as f:
+            json.dump(log_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"Помилка запису журналу: {e}")
 
 
 def article_key(article):
@@ -174,7 +196,7 @@ def fetch_recent_news(hours_back=HOURS_BACK):
         except Exception as e:
             log.warning("RSS error [%s]: %s", source_name, e)
     articles.sort(key=lambda x: x["pub"], reverse=True)
-    log.info("Znaideno %d novyn za %d hod.", len(articles), hours_back)
+    log.info(f"Знайдено {len(articles)} новин за {hours_back} год.")
     return articles
 
 
@@ -306,7 +328,7 @@ def send_preview(text, image_url, callback_data):
         )
     if resp.status_code == 200:
         msg_id = resp.json()["result"]["message_id"]
-        log.info("Preview nadislano adminu (msg_id=%s)", msg_id)
+        log.info(f"Preview надіслано адміну (msg_id={msg_id})")
         return msg_id
     log.error("Pomylka nadislannya preview: %s", resp.text[:200])
     return None
@@ -378,7 +400,7 @@ def notify_admin(text):
 
 
 def main():
-    log.info("=== News Bot zapushcheno ===")
+    log.info("=== News Bot запущено ===")
     missing = [k for k, v in {
         "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
         "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
@@ -386,7 +408,7 @@ def main():
         "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
     }.items() if not v]
     if missing:
-        log.error("Vidsutni zminni: %s. Perevirte config.env", ", ".join(missing))
+        log.error(f"Відсутні змінні: {', '.join(missing)}. Перевір config.env")
         return
 
     # Завантажуємо стан
@@ -406,7 +428,7 @@ def main():
     # Перевіряємо чи час надсилати
     elapsed = now - last_sent
     if elapsed < interval:
-        log.info("Sche ne chas. Rezhym=%s, zalyshylось %.0f хв.", mode, (interval - elapsed) / 60)
+        log.info(f"Ще не час. Режим={mode}, залишилось {(interval - elapsed) / 60:.0f} хв.")
         return
 
     # Збираємо новини
@@ -458,10 +480,13 @@ def main():
 
     decision = wait_for_decision(cb_key, timeout)
 
+    chosen_title = result.get("chosen_title", "")
+
     if decision == "publish":
         published_ok = publish_to_channel(post_text, image_url)
         if published_ok:
             save_published(published, [article_key(a) for a in candidates])
+            save_post_log("published", chosen_title, post_text, image_url)
             notify_admin("✅ Пост опубліковано в канал!")
             # Зберігаємо тему щоб не повторювати
             topics = state.get("published_topics", [])
@@ -475,14 +500,16 @@ def main():
             save_state(state)
     elif decision == "skip":
         save_published(published, [article_key(a) for a in candidates])
+        save_post_log("skipped", chosen_title, post_text, image_url)
         notify_admin("❌ Пост пропущено.")
     else:
         # Таймаут — видаляємо preview і переходимо у slow
         save_published(published, [article_key(a) for a in candidates])
+        save_post_log("timeout", chosen_title, post_text, image_url)
         new_mode = "slow" if mode == "active" else "slow"
         state["mode"] = new_mode
         save_state(state)
-        log.info("Timeout. Rezhym zmineno na: %s", new_mode)
+        log.info(f"Таймаут. Режим змінено на: {new_mode}")
 
 
 if __name__ == "__main__":
