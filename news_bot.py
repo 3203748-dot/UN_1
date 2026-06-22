@@ -342,11 +342,11 @@ def delete_message(msg_id):
         pass
 
 
-def wait_for_decision(cb_key: str, timeout: int = 25 * 60) -> str:
-    """Short-poll (1 хв) — не блокує довго. Повертає 'publish'/'skip'/'timeout'."""
+def wait_for_decision(cb_key: str, timeout: int = 20 * 60) -> str:
+    """Blocking poll. Повертає 'publish'/'skip'/'pending' (якщо час вийшов)."""
     import time
 
-    # Очищаємо старі оновлення
+    # Очищаємо старі оновлення щоб не плутатись
     try:
         resp = requests.get(BASE_TG + "/getUpdates",
                             params={"timeout": 0, "allowed_updates": ["callback_query"]},
@@ -358,12 +358,12 @@ def wait_for_decision(cb_key: str, timeout: int = 25 * 60) -> str:
             requests.get(BASE_TG + "/getUpdates",
                          params={"offset": last_id + 1, "timeout": 0}, timeout=5)
             offset = last_id + 1
+            log.info(f"Очищено {len(updates)} старих оновлень, offset={offset}")
     except Exception as e:
         log.warning(f"Помилка очищення черги: {e}")
         offset = None
 
-    # Чекаємо до 60 секунд (щоб вкластись у GH Actions job)
-    deadline = datetime.now(timezone.utc).timestamp() + 60
+    deadline = datetime.now(timezone.utc).timestamp() + timeout
     while datetime.now(timezone.utc).timestamp() < deadline:
         try:
             params = {"timeout": 20, "allowed_updates": ["callback_query"]}
@@ -378,6 +378,7 @@ def wait_for_decision(cb_key: str, timeout: int = 25 * 60) -> str:
                 data = cb.get("data", "")
                 requests.post(BASE_TG + "/answerCallbackQuery",
                               json={"callback_query_id": cb["id"]}, timeout=5)
+                log.info(f"Callback отримано: {data}")
                 if cb_key in data:
                     return data.split("|")[0]
         except Exception as e:
@@ -586,9 +587,19 @@ def main():
     state["pending_image_url"]  = image_url
     state["pending_title"]      = chosen_title
     state["pending_sent_at"]    = now
-    state.pop("tg_offset", None)   # скидаємо offset — наступний run читатиме з нуля
+    state.pop("tg_offset", None)
     save_state(state)
-    log.info("Preview надіслано. Наступний запуск перевірить рішення.")
+
+    # Чекаємо 20 хв у поточному job — якщо натиснеш одразу, спрацює тут
+    log.info("Preview надіслано. Чекаємо рішення 20 хв...")
+    decision = wait_for_decision(cb_key, 20 * 60)
+    if decision == "publish":
+        _do_publish(state, now)
+    elif decision == "skip":
+        _do_skip(state)
+    else:
+        # "pending" — не натиснуто за 20 хв, наступний run підбере через state.json
+        log.info("Не натиснуто за 20 хв. Наступний запуск перевірить.")
 
 
 if __name__ == "__main__":
