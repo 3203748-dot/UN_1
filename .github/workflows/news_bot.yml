@@ -4,6 +4,10 @@ on:
   schedule:
     - cron: '*/30 * * * *'
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'keep_alive'  # пушимо цей файл раз на тиждень щоб cron не вмирав
 
 concurrency:
   group: news-bot
