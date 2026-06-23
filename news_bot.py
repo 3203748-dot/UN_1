@@ -21,11 +21,12 @@ STATE_FILE = os.path.join(DIR, "state.json")
 PUB_FILE   = os.path.join(DIR, "published.json")
 LOG_FILE   = os.path.join(DIR, "posts_log.json")
 
-ACTIVE_INTERVAL = 90 * 60      # 90 хв між постами (active)
-SLOW_INTERVAL   = 3 * 60 * 60  # 3 год (slow — коли адмін не відповідає)
-POLL_MINUTES    = 20            # скільки хв чекати рішення адміна
-PUB_KEEP_DAYS   = 3             # зберігати URL у published.json N днів
-HOURS_BACK      = 6             # брати новини за останні N год
+ACTIVE_INTERVAL = 90 * 60   # ✅ або старт → наступне preview через 90 хв
+SLOW_INTERVAL   = 180 * 60  # без дії → наступне preview через 180 хв (slow)
+SKIP_INTERVAL   = 30 * 60   # ❌ → наступне preview через 30 хв
+POLL_MINUTES    = 29         # скільки хв чекати рішення адміна
+PUB_KEEP_DAYS   = 3          # зберігати URL у published.json N днів
+HOURS_BACK      = 6          # брати новини за останні N год
 
 # Manual run = workflow_dispatch. Використовуємо вбудовану змінну GitHub Actions.
 MANUAL_RUN = os.getenv("GITHUB_EVENT_NAME", "") == "workflow_dispatch"
@@ -333,6 +334,7 @@ def poll(cb_key, minutes):
 # ─── Publish / Skip ───────────────────────────────────────────────────────────
 
 def do_publish(state):
+    """✅ Публікуємо. Наступне preview через 90 хв. Якщо були в slow → повертаємось в active."""
     text  = state.get("pending_text", "")
     image = state.get("pending_image")
     title = state.get("pending_title", "")
@@ -341,22 +343,36 @@ def do_publish(state):
     if ok:
         write_log("published", title, text, image or "")
         _add_recent_event(state, text)
-        state["last_sent"] = 0   # скидаємо → наступний ран одразу генерує новий пост
-        state["mode"] = "active"
+        state["mode"]      = "active"
+        state["last_sent"] = time.time()   # наступне preview через 90 хв
         notify("✅ Пост опубліковано в канал!")
     else:
-        state["last_sent"] = 0   # скидаємо — наступний run спробує знову
+        state["last_sent"] = 0  # помилка → наступний run спробує знову
         notify("⚠️ Помилка публікації — перевір логи")
 
     _clear_pending(state)
     save_state(state)
 
 def do_skip(state):
+    """❌ Пропускаємо. Наступне preview через 30 хв (будь-який режим)."""
     title = state.get("pending_title", "")
     text  = state.get("pending_text", "")
     write_log("skipped", title)
     _add_recent_event(state, text)
-    notify("❌ Пост пропущено.")
+    # Незалежно від режиму — наступне preview через 30 хв
+    mode     = state.get("mode", "active")
+    interval = ACTIVE_INTERVAL if mode == "active" else SLOW_INTERVAL
+    state["last_sent"] = time.time() - interval + SKIP_INTERVAL
+    notify("❌ Пост пропущено. Наступне preview через 30 хв.")
+    _clear_pending(state)
+    save_state(state)
+
+def do_timeout(state):
+    """Без дій 20 хв → slow mode. Наступне preview через 180 хв."""
+    write_log("timeout", state.get("pending_title", ""))
+    state["mode"]      = "slow"
+    state["last_sent"] = time.time()   # наступне preview через 180 хв
+    notify("⏰ Час вийшов — режим slow. Наступне preview через 3 год.")
     _clear_pending(state)
     save_state(state)
 
@@ -431,12 +447,9 @@ def main():
                 state = load_state()
                 # fall through → генеруємо нову новину
             elif elapsed > POLL_MINUTES * 60:
-                # >20 хв без рішення → slow режим (наступний пост через 3 год)
-                log.info(f"Timeout: pending {elapsed/60:.0f} хв без рішення → slow mode")
-                write_log("timeout", state.get("pending_title", ""))
-                state["mode"] = "slow"
-                _clear_pending(state)
-                save_state(state)
+                # >20 хв без рішення → slow mode, наступне через 180 хв
+                log.info(f"Timeout: {elapsed/60:.0f} хв без рішення → slow mode")
+                do_timeout(state)
                 return
             else:
                 log.info(f"Ще очікуємо ({(POLL_MINUTES*60 - elapsed)/60:.1f} хв left)")
